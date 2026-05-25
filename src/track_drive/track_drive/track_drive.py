@@ -2,23 +2,15 @@
 # -*- coding: utf-8 -*-
 
 # =============================================
-# Xycar ROS2 자율주행
+# Xycar ROS2 차선 유지 주행
 #
-# 기능
-# 1. 차선 유지 주행 (2차선 기준)
-# 2. 흰색 / 노란색 모두 인식
-# 3. 오른쪽 실선 기준 주행
-# 4. 곡선 대응 PID 제어
-#
-# 트랙 구조
-# 흰/노란 실선 | 1차선 | 노란 점선 | 2차선 | 흰/노란 실선
-#
-# 차량 목표:
-# "2차선 유지"
-#
-# 방식:
-# 오른쪽 차선을 기준으로
-# 왼쪽 offset 만큼 떨어져 주행
+# 핵심 개선:
+# 1. 흰색 + 노란색 모두 인식
+# 2. ROI 아래쪽만 사용
+# 3. 가장 아래 차선 좌표 사용
+# 4. 좌우 차선 모두 이용
+# 5. 차선 중앙 기반 steering
+# 6. PID + smoothing
 # =============================================
 
 import rclpy
@@ -27,7 +19,6 @@ import numpy as np
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from sensor_msgs.msg import LaserScan
 from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
@@ -43,39 +34,30 @@ class TrackDriverNode(Node):
         super().__init__('driver')
 
         self.image = None
-        self.lidar_ranges = None
 
         self.bridge = CvBridge()
 
         self.motor_msg = XycarMotor()
 
-        # PID 변수
+        # PID
         self.prev_error = 0
         self.integral = 0
 
         # steering smoothing
         self.prev_angle = 0
 
-        # Publisher
+        # publisher
         self.motor_pub = self.create_publisher(
             XycarMotor,
             'xycar_motor',
             10
         )
 
-        # Camera Subscriber
+        # subscriber
         self.sub_cam = self.create_subscription(
             Image,
             '/usb_cam/image_raw/front',
             self.cam_callback,
-            qos_profile_sensor_data
-        )
-
-        # LiDAR Subscriber
-        self.sub_lidar = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.lidar_callback,
             qos_profile_sensor_data
         )
 
@@ -90,13 +72,6 @@ class TrackDriverNode(Node):
             data,
             "bgr8"
         )
-
-    # =========================================
-    # 라이다 콜백
-    # =========================================
-    def lidar_callback(self, msg):
-
-        self.lidar_ranges = msg.ranges
 
     # =========================================
     # 차량 제어
@@ -117,9 +92,10 @@ class TrackDriverNode(Node):
 
         # =====================================
         # ROI
+        # 아래 30%만 사용
         # =====================================
         roi = frame[
-            int(height * 0.55):height,
+            int(height * 0.7):height,
             :
         ]
 
@@ -134,11 +110,8 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 밝은 차선 전체 검출
-        # 흰색 + 노란색 둘 다 포함
+        # 흰색 차선
         # =====================================
-
-        # 흰색
         lower_white = np.array([0, 0, 140])
         upper_white = np.array([180, 90, 255])
 
@@ -148,7 +121,9 @@ class TrackDriverNode(Node):
             upper_white
         )
 
-        # 노란색
+        # =====================================
+        # 노란색 차선
+        # =====================================
         lower_yellow = np.array([10, 70, 70])
         upper_yellow = np.array([40, 255, 255])
 
@@ -158,7 +133,9 @@ class TrackDriverNode(Node):
             upper_yellow
         )
 
+        # =====================================
         # 합치기
+        # =====================================
         mask = cv2.bitwise_or(
             white_mask,
             yellow_mask
@@ -191,7 +168,7 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # Edge
+        # Canny
         # =====================================
         edges = cv2.Canny(
             blur,
@@ -206,23 +183,23 @@ class TrackDriverNode(Node):
             edges,
             1,
             np.pi / 180,
-            30,
-            minLineLength=40,
-            maxLineGap=50
+            25,
+            minLineLength=25,
+            maxLineGap=30
         )
 
         # =====================================
-        # 차선 없으면 이전 steering 유지
+        # 차선 없으면 이전값 유지
         # =====================================
         if lines is None:
 
             return self.prev_angle
 
-        left_lines = []
-        right_lines = []
+        left_candidates = []
+        right_candidates = []
 
         # =====================================
-        # 좌우 차선 분리
+        # 선 탐색
         # =====================================
         for line in lines:
 
@@ -237,18 +214,22 @@ class TrackDriverNode(Node):
             if abs(slope) < 0.3:
                 continue
 
-            avg_x = (x1 + x2) // 2
-
-            # 아래쪽 점 사용
+            # =================================
+            # 가장 아래 점 사용
+            # =================================
             if y1 > y2:
                 x_bottom = x1
+                y_bottom = y1
             else:
                 x_bottom = x2
+                y_bottom = y2
 
+            # =================================
             # 왼쪽 차선
-            if avg_x < roi_w // 2:
+            # =================================
+            if x_bottom < roi_w // 2:
 
-                left_lines.append(x_bottom)
+                left_candidates.append(x_bottom)
 
                 cv2.line(
                     roi,
@@ -258,10 +239,12 @@ class TrackDriverNode(Node):
                     3
                 )
 
+            # =================================
             # 오른쪽 차선
+            # =================================
             else:
 
-                right_lines.append(x_bottom)
+                right_candidates.append(x_bottom)
 
                 cv2.line(
                     roi,
@@ -272,26 +255,28 @@ class TrackDriverNode(Node):
                 )
 
         # =====================================
-        # 오른쪽 차선 우선 사용
+        # 차선 부족
         # =====================================
-        if len(right_lines) == 0:
-
+        if len(left_candidates) == 0:
             return self.prev_angle
 
-        right_lane = int(np.mean(right_lines))
+        if len(right_candidates) == 0:
+            return self.prev_angle
 
         # =====================================
-        # 2차선 중앙 offset
-        #
-        # 오른쪽 실선 기준
-        # 왼쪽으로 offset
+        # 가장 바깥쪽 차선 선택
         # =====================================
-        offset = 170
+        left_lane = min(left_candidates)
 
-        lane_center = right_lane - offset
+        right_lane = max(right_candidates)
 
         # =====================================
-        # 목표 중앙
+        # 차선 중앙
+        # =====================================
+        lane_center = (left_lane + right_lane) // 2
+
+        # =====================================
+        # 차량 목표 중앙
         # =====================================
         target = roi_w // 2
 
@@ -303,8 +288,8 @@ class TrackDriverNode(Node):
         # =====================================
         # PID
         # =====================================
-        kp = 0.45
-        kd = 0.15
+        kp = 0.55
+        kd = 0.20
         ki = 0.0005
 
         self.integral += error
@@ -323,8 +308,8 @@ class TrackDriverNode(Node):
         # smoothing
         # =====================================
         angle = (
-            0.65 * self.prev_angle +
-            0.35 * angle
+            0.7 * self.prev_angle +
+            0.3 * angle
         )
 
         self.prev_angle = angle
@@ -339,9 +324,17 @@ class TrackDriverNode(Node):
         # =====================================
         cv2.circle(
             roi,
-            (right_lane, roi_h - 20),
+            (left_lane, roi_h - 20),
             8,
             (255, 255, 255),
+            -1
+        )
+
+        cv2.circle(
+            roi,
+            (right_lane, roi_h - 20),
+            8,
+            (0, 255, 255),
             -1
         )
 
@@ -357,7 +350,7 @@ class TrackDriverNode(Node):
             roi,
             (target, 0),
             (target, roi_h),
-            (0, 255, 255),
+            (0, 255, 0),
             2
         )
 
@@ -365,6 +358,7 @@ class TrackDriverNode(Node):
         cv2.imshow("edges", edges)
         cv2.imshow("lane_roi", roi)
 
+        print("left_lane  :", left_lane)
         print("right_lane :", right_lane)
         print("lane_center:", lane_center)
         print("error      :", error)
@@ -394,10 +388,10 @@ class TrackDriverNode(Node):
             # 속도 제어
             speed = 4
 
-            if abs(angle) > 20:
+            if abs(angle) > 15:
                 speed = 3
 
-            if abs(angle) > 35:
+            if abs(angle) > 30:
                 speed = 2
 
             self.drive(angle, speed)
