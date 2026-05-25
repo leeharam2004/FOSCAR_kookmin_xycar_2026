@@ -1,0 +1,11 @@
+# Ignore ROS 2 build artifacts
+install/
+build/
+log/
+
+# Ignore Python artifacts
+__pycache__/
+*.pyc
+
+# Ignore OS-specific files
+.DS_Store
