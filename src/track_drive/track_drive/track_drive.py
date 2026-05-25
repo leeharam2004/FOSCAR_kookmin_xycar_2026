@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# =============================================
+# Xycar ROS2 자율주행
+#
+# 기능
+# 1. 차선 유지 주행 (2차선 기준)
+# 2. 흰색 / 노란색 모두 인식
+# 3. 오른쪽 실선 기준 주행
+# 4. 곡선 대응 PID 제어
+#
+# 트랙 구조
+# 흰/노란 실선 | 1차선 | 노란 점선 | 2차선 | 흰/노란 실선
+#
+# 차량 목표:
+# "2차선 유지"
+#
+# 방식:
+# 오른쪽 차선을 기준으로
+# 왼쪽 offset 만큼 떨어져 주행
+# =============================================
+
 import rclpy
 import cv2
-import time
 import numpy as np
 
 from rclpy.node import Node
@@ -30,12 +49,12 @@ class TrackDriverNode(Node):
 
         self.motor_msg = XycarMotor()
 
-        # steering 저장
-        self.prev_angle = 0
-
-        # PID
+        # PID 변수
         self.prev_error = 0
         self.integral = 0
+
+        # steering smoothing
+        self.prev_angle = 0
 
         # Publisher
         self.motor_pub = self.create_publisher(
@@ -60,7 +79,7 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data
         )
 
-        self.get_logger().info("===== START =====")
+        self.get_logger().info("===== TRACK DRIVER START =====")
 
     # =========================================
     # 카메라 콜백
@@ -115,8 +134,11 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 흰색 차선 범위
+        # 밝은 차선 전체 검출
+        # 흰색 + 노란색 둘 다 포함
         # =====================================
+
+        # 흰색
         lower_white = np.array([0, 0, 140])
         upper_white = np.array([180, 90, 255])
 
@@ -126,19 +148,35 @@ class TrackDriverNode(Node):
             upper_white
         )
 
+        # 노란색
+        lower_yellow = np.array([10, 70, 70])
+        upper_yellow = np.array([40, 255, 255])
+
+        yellow_mask = cv2.inRange(
+            hsv,
+            lower_yellow,
+            upper_yellow
+        )
+
+        # 합치기
+        mask = cv2.bitwise_or(
+            white_mask,
+            yellow_mask
+        )
+
         # =====================================
         # morphology
         # =====================================
         kernel = np.ones((5, 5), np.uint8)
 
-        white_mask = cv2.morphologyEx(
-            white_mask,
+        mask = cv2.morphologyEx(
+            mask,
             cv2.MORPH_CLOSE,
             kernel
         )
 
-        white_mask = cv2.morphologyEx(
-            white_mask,
+        mask = cv2.morphologyEx(
+            mask,
             cv2.MORPH_OPEN,
             kernel
         )
@@ -147,13 +185,13 @@ class TrackDriverNode(Node):
         # Blur
         # =====================================
         blur = cv2.GaussianBlur(
-            white_mask,
+            mask,
             (5, 5),
             0
         )
 
         # =====================================
-        # Canny
+        # Edge
         # =====================================
         edges = cv2.Canny(
             blur,
@@ -162,7 +200,7 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # Hough
+        # HoughLinesP
         # =====================================
         lines = cv2.HoughLinesP(
             edges,
@@ -174,22 +212,22 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 차선 없으면 이전값 유지
+        # 차선 없으면 이전 steering 유지
         # =====================================
         if lines is None:
 
             return self.prev_angle
 
         left_lines = []
+        right_lines = []
 
         # =====================================
-        # 왼쪽 흰 실선만 사용
+        # 좌우 차선 분리
         # =====================================
         for line in lines:
 
             x1, y1, x2, y2 = line[0]
 
-            # 수직선 방지
             if x2 == x1:
                 continue
 
@@ -199,11 +237,7 @@ class TrackDriverNode(Node):
             if abs(slope) < 0.3:
                 continue
 
-            # 화면 왼쪽만 사용
             avg_x = (x1 + x2) // 2
-
-            if avg_x > roi_w // 2:
-                continue
 
             # 아래쪽 점 사용
             if y1 > y2:
@@ -211,37 +245,53 @@ class TrackDriverNode(Node):
             else:
                 x_bottom = x2
 
-            left_lines.append(x_bottom)
+            # 왼쪽 차선
+            if avg_x < roi_w // 2:
 
-            cv2.line(
-                roi,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                3
-            )
+                left_lines.append(x_bottom)
+
+                cv2.line(
+                    roi,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 0),
+                    3
+                )
+
+            # 오른쪽 차선
+            else:
+
+                right_lines.append(x_bottom)
+
+                cv2.line(
+                    roi,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 0, 255),
+                    3
+                )
 
         # =====================================
-        # 차선 못 찾으면 이전값 유지
+        # 오른쪽 차선 우선 사용
         # =====================================
-        if len(left_lines) == 0:
+        if len(right_lines) == 0:
 
             return self.prev_angle
 
-        # =====================================
-        # 왼쪽 차선 위치
-        # =====================================
-        left_lane = int(np.mean(left_lines))
+        right_lane = int(np.mean(right_lines))
 
         # =====================================
-        # 차선 중앙 offset
+        # 2차선 중앙 offset
+        #
+        # 오른쪽 실선 기준
+        # 왼쪽으로 offset
         # =====================================
         offset = 170
 
-        lane_center = left_lane + offset
+        lane_center = right_lane - offset
 
         # =====================================
-        # 차량 목표 중앙
+        # 목표 중앙
         # =====================================
         target = roi_w // 2
 
@@ -273,8 +323,8 @@ class TrackDriverNode(Node):
         # smoothing
         # =====================================
         angle = (
-            0.6 * self.prev_angle +
-            0.4 * angle
+            0.65 * self.prev_angle +
+            0.35 * angle
         )
 
         self.prev_angle = angle
@@ -285,11 +335,11 @@ class TrackDriverNode(Node):
         angle = max(min(angle, 50), -50)
 
         # =====================================
-        # 디버그
+        # 디버그 표시
         # =====================================
         cv2.circle(
             roi,
-            (left_lane, roi_h - 20),
+            (right_lane, roi_h - 20),
             8,
             (255, 255, 255),
             -1
@@ -299,7 +349,7 @@ class TrackDriverNode(Node):
             roi,
             (lane_center, roi_h - 40),
             10,
-            (0, 0, 255),
+            (255, 0, 0),
             -1
         )
 
@@ -307,18 +357,18 @@ class TrackDriverNode(Node):
             roi,
             (target, 0),
             (target, roi_h),
-            (255, 0, 0),
+            (0, 255, 255),
             2
         )
 
-        cv2.imshow("white_mask", white_mask)
+        cv2.imshow("mask", mask)
         cv2.imshow("edges", edges)
         cv2.imshow("lane_roi", roi)
 
-        print("left_lane :", left_lane)
-        print("lane_center :", lane_center)
-        print("error :", error)
-        print("angle :", angle)
+        print("right_lane :", right_lane)
+        print("lane_center:", lane_center)
+        print("error      :", error)
+        print("angle      :", angle)
 
         return angle
 
@@ -341,7 +391,7 @@ class TrackDriverNode(Node):
 
             angle = self.lane_driving(frame)
 
-            # 속도 조절
+            # 속도 제어
             speed = 4
 
             if abs(angle) > 20:
@@ -370,7 +420,7 @@ class TrackDriverNode(Node):
 
 
 # =============================================
-# main 함수
+# main
 # =============================================
 def main(args=None):
 
