@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# =============================================
-# Xycar ROS2 자율주행
-#
-# 핵심 수정 사항
-# 1. 차선 "선분 평균" 방식 제거
-# 2. 화면 하단 기준 실제 차선 위치 사용
-# 3. 차선 유지 PID 강화
-# 4. 곡선에서도 차선 유지 가능
-#
-# 트랙 구조
-# [흰 실선] 1차선 [노란 점선] 2차선 [흰 실선]
-#
-# 차량은:
-# 왼쪽 흰 실선 + 중앙 노란 점선 사이
-# (= 1차선)
-# 를 유지하도록 설계
-# =============================================
-
 import rclpy
 import cv2
 import time
@@ -48,26 +30,21 @@ class TrackDriverNode(Node):
 
         self.motor_msg = XycarMotor()
 
+        # steering 저장
         self.prev_angle = 0
 
-        # =====================================
         # PID
-        # =====================================
         self.prev_error = 0
         self.integral = 0
 
-        # =====================================
         # Publisher
-        # =====================================
         self.motor_pub = self.create_publisher(
             XycarMotor,
             'xycar_motor',
             10
         )
 
-        # =====================================
         # Camera Subscriber
-        # =====================================
         self.sub_cam = self.create_subscription(
             Image,
             '/usb_cam/image_raw/front',
@@ -75,9 +52,7 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data
         )
 
-        # =====================================
         # LiDAR Subscriber
-        # =====================================
         self.sub_lidar = self.create_subscription(
             LaserScan,
             '/scan',
@@ -123,7 +98,6 @@ class TrackDriverNode(Node):
 
         # =====================================
         # ROI
-        # 화면 아래만 사용
         # =====================================
         roi = frame[
             int(height * 0.55):height,
@@ -141,10 +115,10 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 흰 차선
+        # 흰색 차선 범위
         # =====================================
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([255, 70, 255])
+        lower_white = np.array([0, 0, 140])
+        upper_white = np.array([180, 90, 255])
 
         white_mask = cv2.inRange(
             hsv,
@@ -153,28 +127,27 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 노란 점선
+        # morphology
         # =====================================
-        lower_yellow = np.array([15, 80, 80])
-        upper_yellow = np.array([40, 255, 255])
+        kernel = np.ones((5, 5), np.uint8)
 
-        yellow_mask = cv2.inRange(
-            hsv,
-            lower_yellow,
-            upper_yellow
+        white_mask = cv2.morphologyEx(
+            white_mask,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
+
+        white_mask = cv2.morphologyEx(
+            white_mask,
+            cv2.MORPH_OPEN,
+            kernel
         )
 
         # =====================================
         # Blur
         # =====================================
-        white_mask = cv2.GaussianBlur(
+        blur = cv2.GaussianBlur(
             white_mask,
-            (5, 5),
-            0
-        )
-
-        yellow_mask = cv2.GaussianBlur(
-            yellow_mask,
             (5, 5),
             0
         )
@@ -182,14 +155,8 @@ class TrackDriverNode(Node):
         # =====================================
         # Canny
         # =====================================
-        white_edges = cv2.Canny(
-            white_mask,
-            50,
-            150
-        )
-
-        yellow_edges = cv2.Canny(
-            yellow_mask,
+        edges = cv2.Canny(
+            blur,
             50,
             150
         )
@@ -197,52 +164,45 @@ class TrackDriverNode(Node):
         # =====================================
         # Hough
         # =====================================
-        white_lines = cv2.HoughLinesP(
-            white_edges,
+        lines = cv2.HoughLinesP(
+            edges,
             1,
             np.pi / 180,
             30,
-            minLineLength=30,
-            maxLineGap=40
-        )
-
-        yellow_lines = cv2.HoughLinesP(
-            yellow_edges,
-            1,
-            np.pi / 180,
-            15,
-            minLineLength=15,
-            maxLineGap=60
+            minLineLength=40,
+            maxLineGap=50
         )
 
         # =====================================
         # 차선 없으면 이전값 유지
         # =====================================
-        if white_lines is None or yellow_lines is None:
+        if lines is None:
 
             return self.prev_angle
 
-        # =====================================
-        # 실제 차선 위치 찾기
-        # 화면 하단 기준
-        # =====================================
-        left_positions = []
-        right_positions = []
+        left_lines = []
 
         # =====================================
-        # 흰 실선
-        # 왼쪽 차선
+        # 왼쪽 흰 실선만 사용
         # =====================================
-        for line in white_lines:
+        for line in lines:
 
             x1, y1, x2, y2 = line[0]
 
-            slope = 999
+            # 수직선 방지
+            if x2 == x1:
+                continue
 
-            if x2 != x1:
-                slope = (y2 - y1) / (x2 - x1)
+            slope = (y2 - y1) / (x2 - x1)
 
-            if abs(slope) < 0.2:
+            # 수평 제거
+            if abs(slope) < 0.3:
+                continue
+
+            # 화면 왼쪽만 사용
+            avg_x = (x1 + x2) // 2
+
+            if avg_x > roi_w // 2:
                 continue
 
             # 아래쪽 점 사용
@@ -251,69 +211,34 @@ class TrackDriverNode(Node):
             else:
                 x_bottom = x2
 
-            left_positions.append(x_bottom)
+            left_lines.append(x_bottom)
 
             cv2.line(
                 roi,
                 (x1, y1),
                 (x2, y2),
-                (255, 255, 255),
+                (0, 255, 0),
                 3
             )
 
         # =====================================
-        # 노란 점선
-        # 오른쪽 차선
+        # 차선 못 찾으면 이전값 유지
         # =====================================
-        for line in yellow_lines:
-
-            x1, y1, x2, y2 = line[0]
-
-            slope = 999
-
-            if x2 != x1:
-                slope = (y2 - y1) / (x2 - x1)
-
-            if abs(slope) < 0.2:
-                continue
-
-            # 아래쪽 점 사용
-            if y1 > y2:
-                x_bottom = x1
-            else:
-                x_bottom = x2
-
-            right_positions.append(x_bottom)
-
-            cv2.line(
-                roi,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 255),
-                3
-            )
-
-        # =====================================
-        # 차선 부족
-        # =====================================
-        if len(left_positions) == 0:
-
-            return self.prev_angle
-
-        if len(right_positions) == 0:
+        if len(left_lines) == 0:
 
             return self.prev_angle
 
         # =====================================
-        # 실제 차선 위치
+        # 왼쪽 차선 위치
         # =====================================
-        left_lane = int(np.mean(left_positions))
-        right_lane = int(np.mean(right_positions))
+        left_lane = int(np.mean(left_lines))
 
         # =====================================
-        # 1차선 중앙
+        # 차선 중앙 offset
         # =====================================
-        lane_center = (left_lane + right_lane) // 2
+        offset = 170
+
+        lane_center = left_lane + offset
 
         # =====================================
         # 차량 목표 중앙
@@ -321,15 +246,15 @@ class TrackDriverNode(Node):
         target = roi_w // 2
 
         # =====================================
-        # 오차
+        # 오차 계산
         # =====================================
         error = target - lane_center
 
         # =====================================
         # PID
         # =====================================
-        kp = 0.40
-        kd = 0.12
+        kp = 0.45
+        kd = 0.15
         ki = 0.0005
 
         self.integral += error
@@ -348,8 +273,8 @@ class TrackDriverNode(Node):
         # smoothing
         # =====================================
         angle = (
-            0.7 * self.prev_angle +
-            0.3 * angle
+            0.6 * self.prev_angle +
+            0.4 * angle
         )
 
         self.prev_angle = angle
@@ -372,14 +297,6 @@ class TrackDriverNode(Node):
 
         cv2.circle(
             roi,
-            (right_lane, roi_h - 20),
-            8,
-            (0, 255, 255),
-            -1
-        )
-
-        cv2.circle(
-            roi,
             (lane_center, roi_h - 40),
             10,
             (0, 0, 255),
@@ -395,14 +312,13 @@ class TrackDriverNode(Node):
         )
 
         cv2.imshow("white_mask", white_mask)
-        cv2.imshow("yellow_mask", yellow_mask)
+        cv2.imshow("edges", edges)
         cv2.imshow("lane_roi", roi)
 
         print("left_lane :", left_lane)
-        print("right_lane:", right_lane)
-        print("lane_center:", lane_center)
-        print("error:", error)
-        print("angle:", angle)
+        print("lane_center :", lane_center)
+        print("error :", error)
+        print("angle :", angle)
 
         return angle
 
@@ -425,9 +341,9 @@ class TrackDriverNode(Node):
 
             angle = self.lane_driving(frame)
 
+            # 속도 조절
             speed = 4
 
-            # 커브 감속
             if abs(angle) > 20:
                 speed = 3
 
@@ -454,7 +370,7 @@ class TrackDriverNode(Node):
 
 
 # =============================================
-# main
+# main 함수
 # =============================================
 def main(args=None):
 
