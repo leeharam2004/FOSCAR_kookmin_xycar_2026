@@ -2,15 +2,23 @@
 # -*- coding: utf-8 -*-
 
 # =============================================
-# Xycar ROS2 차선 유지 주행
+# ROS2 Xycar Sliding Window Lane Driving
 #
-# 핵심 개선:
-# 1. 흰색 + 노란색 모두 인식
-# 2. ROI 아래쪽만 사용
-# 3. 가장 아래 차선 좌표 사용
-# 4. 좌우 차선 모두 이용
-# 5. 차선 중앙 기반 steering
-# 6. PID + smoothing
+# 기반:
+# KUAC 2024 우승팀 slidewindow 알고리즘
+#
+# 수정:
+# - ROS1 → ROS2 변환
+# - 시뮬레이터용 튜닝
+# - xycar_motor 적용
+# - PID steering 추가
+# - Bird Eye View 추가
+#
+# 특징:
+# 1. 흰색/노란색 모두 인식
+# 2. 곡선 차선 안정적
+# 3. 양쪽 차선 모두 사용
+# 4. 한쪽 차선만 보여도 추정 가능
 # =============================================
 
 import rclpy
@@ -24,11 +32,157 @@ from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
 
 
+# =============================================
+# Sliding Window Class
+# =============================================
+class SlideWindow:
+
+    def __init__(self):
+
+        self.x_previous = 320
+
+    def slidewindow(self, img):
+
+        out_img = np.dstack((img, img, img))
+
+        height = img.shape[0]
+        width = img.shape[1]
+
+        # nonzero pixel
+        nonzero = img.nonzero()
+
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+
+        # window parameter
+        nwindows = 10
+        window_height = 15
+
+        margin = 40
+        minpix = 20
+
+        # start region
+        left_region = img[height-80:height, :width//2]
+        right_region = img[height-80:height, width//2:]
+
+        # histogram
+        left_hist = np.sum(left_region, axis=0)
+        right_hist = np.sum(right_region, axis=0)
+
+        # start x
+        leftx_current = np.argmax(left_hist)
+
+        rightx_current = np.argmax(right_hist) + width//2
+
+        left_lane_inds = []
+        right_lane_inds = []
+
+        # =====================================
+        # sliding windows
+        # =====================================
+        for window in range(nwindows):
+
+            win_y_low = height - (window + 1) * window_height
+            win_y_high = height - window * window_height
+
+            # left window
+            win_xleft_low = leftx_current - margin
+            win_xleft_high = leftx_current + margin
+
+            # right window
+            win_xright_low = rightx_current - margin
+            win_xright_high = rightx_current + margin
+
+            # draw windows
+            cv2.rectangle(
+                out_img,
+                (win_xleft_low, win_y_low),
+                (win_xleft_high, win_y_high),
+                (0, 255, 0),
+                2
+            )
+
+            cv2.rectangle(
+                out_img,
+                (win_xright_low, win_y_low),
+                (win_xright_high, win_y_high),
+                (255, 0, 0),
+                2
+            )
+
+            # good left inds
+            good_left_inds = (
+                (
+                    (nonzeroy >= win_y_low) &
+                    (nonzeroy < win_y_high) &
+                    (nonzerox >= win_xleft_low) &
+                    (nonzerox < win_xleft_high)
+                ).nonzero()[0]
+            )
+
+            # good right inds
+            good_right_inds = (
+                (
+                    (nonzeroy >= win_y_low) &
+                    (nonzeroy < win_y_high) &
+                    (nonzerox >= win_xright_low) &
+                    (nonzerox < win_xright_high)
+                ).nonzero()[0]
+            )
+
+            left_lane_inds.append(good_left_inds)
+            right_lane_inds.append(good_right_inds)
+
+            # next window position
+            if len(good_left_inds) > minpix:
+
+                leftx_current = int(
+                    np.mean(nonzerox[good_left_inds])
+                )
+
+            if len(good_right_inds) > minpix:
+
+                rightx_current = int(
+                    np.mean(nonzerox[good_right_inds])
+                )
+
+        # concatenate
+        left_lane_inds = np.concatenate(left_lane_inds)
+        right_lane_inds = np.concatenate(right_lane_inds)
+
+        # fallback
+        if len(left_lane_inds) == 0 or len(right_lane_inds) == 0:
+
+            x_location = self.x_previous
+
+            return out_img, x_location
+
+        # lane x
+        leftx = np.mean(nonzerox[left_lane_inds])
+        rightx = np.mean(nonzerox[right_lane_inds])
+
+        # lane center
+        x_location = int((leftx + rightx) // 2)
+
+        self.x_previous = x_location
+
+        # draw center
+        cv2.circle(
+            out_img,
+            (x_location, height-40),
+            10,
+            (0, 0, 255),
+            -1
+        )
+
+        return out_img, x_location
+
+
+# =============================================
+# Main ROS2 Node
+# =============================================
 class TrackDriverNode(Node):
 
-    # =========================================
-    # 초기화
-    # =========================================
     def __init__(self):
 
         super().__init__('driver')
@@ -37,13 +191,14 @@ class TrackDriverNode(Node):
 
         self.bridge = CvBridge()
 
+        self.slidewindow = SlideWindow()
+
         self.motor_msg = XycarMotor()
 
         # PID
         self.prev_error = 0
         self.integral = 0
 
-        # steering smoothing
         self.prev_angle = 0
 
         # publisher
@@ -53,7 +208,7 @@ class TrackDriverNode(Node):
             10
         )
 
-        # subscriber
+        # camera subscriber
         self.sub_cam = self.create_subscription(
             Image,
             '/usb_cam/image_raw/front',
@@ -61,10 +216,10 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data
         )
 
-        self.get_logger().info("===== TRACK DRIVER START =====")
+        self.get_logger().info("===== Sliding Window Start =====")
 
     # =========================================
-    # 카메라 콜백
+    # camera callback
     # =========================================
     def cam_callback(self, data):
 
@@ -74,7 +229,7 @@ class TrackDriverNode(Node):
         )
 
     # =========================================
-    # 차량 제어
+    # drive
     # =========================================
     def drive(self, angle, speed):
 
@@ -84,36 +239,49 @@ class TrackDriverNode(Node):
         self.motor_pub.publish(self.motor_msg)
 
     # =========================================
-    # 차선 주행
+    # bird eye view
     # =========================================
-    def lane_driving(self, frame):
+    def bird_eye_view(self, frame):
 
-        height, width, _ = frame.shape
+        height, width = frame.shape[:2]
 
-        # =====================================
-        # ROI
-        # 아래 30%만 사용
-        # =====================================
-        roi = frame[
-            int(height * 0.7):height,
-            :
-        ]
+        src = np.float32([
+            [220, 320],
+            [420, 320],
+            [100, 480],
+            [540, 480]
+        ])
 
-        roi_h, roi_w, _ = roi.shape
+        dst = np.float32([
+            [180, 0],
+            [460, 0],
+            [180, 480],
+            [460, 480]
+        ])
 
-        # =====================================
-        # HSV 변환
-        # =====================================
+        matrix = cv2.getPerspectiveTransform(src, dst)
+
+        warped = cv2.warpPerspective(
+            frame,
+            matrix,
+            (width, height)
+        )
+
+        return warped
+
+    # =========================================
+    # preprocessing
+    # =========================================
+    def preprocessing(self, frame):
+
         hsv = cv2.cvtColor(
-            roi,
+            frame,
             cv2.COLOR_BGR2HSV
         )
 
-        # =====================================
-        # 흰색 차선
-        # =====================================
+        # white
         lower_white = np.array([0, 0, 140])
-        upper_white = np.array([180, 90, 255])
+        upper_white = np.array([180, 80, 255])
 
         white_mask = cv2.inRange(
             hsv,
@@ -121,9 +289,7 @@ class TrackDriverNode(Node):
             upper_white
         )
 
-        # =====================================
-        # 노란색 차선
-        # =====================================
+        # yellow
         lower_yellow = np.array([10, 70, 70])
         upper_yellow = np.array([40, 255, 255])
 
@@ -133,17 +299,13 @@ class TrackDriverNode(Node):
             upper_yellow
         )
 
-        # =====================================
-        # 합치기
-        # =====================================
+        # merge
         mask = cv2.bitwise_or(
             white_mask,
             yellow_mask
         )
 
-        # =====================================
         # morphology
-        # =====================================
         kernel = np.ones((5, 5), np.uint8)
 
         mask = cv2.morphologyEx(
@@ -152,145 +314,38 @@ class TrackDriverNode(Node):
             kernel
         )
 
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_OPEN,
-            kernel
-        )
-
-        # =====================================
-        # Blur
-        # =====================================
-        blur = cv2.GaussianBlur(
+        mask = cv2.GaussianBlur(
             mask,
             (5, 5),
             0
         )
 
-        # =====================================
-        # Canny
-        # =====================================
-        edges = cv2.Canny(
-            blur,
-            50,
-            150
-        )
+        return mask
 
-        # =====================================
-        # HoughLinesP
-        # =====================================
-        lines = cv2.HoughLinesP(
-            edges,
-            1,
-            np.pi / 180,
-            25,
-            minLineLength=25,
-            maxLineGap=30
-        )
+    # =========================================
+    # lane driving
+    # =========================================
+    def lane_driving(self, frame):
 
-        # =====================================
-        # 차선 없으면 이전값 유지
-        # =====================================
-        if lines is None:
+        # bird eye
+        bev = self.bird_eye_view(frame)
 
-            return self.prev_angle
+        # binary
+        binary = self.preprocessing(bev)
 
-        left_candidates = []
-        right_candidates = []
+        # sliding window
+        out_img, lane_center = self.slidewindow.slidewindow(binary)
 
-        # =====================================
-        # 선 탐색
-        # =====================================
-        for line in lines:
+        # target center
+        target = 320
 
-            x1, y1, x2, y2 = line[0]
-
-            if x2 == x1:
-                continue
-
-            slope = (y2 - y1) / (x2 - x1)
-
-            # 수평 제거
-            if abs(slope) < 0.3:
-                continue
-
-            # =================================
-            # 가장 아래 점 사용
-            # =================================
-            if y1 > y2:
-                x_bottom = x1
-                y_bottom = y1
-            else:
-                x_bottom = x2
-                y_bottom = y2
-
-            # =================================
-            # 왼쪽 차선
-            # =================================
-            if x_bottom < roi_w // 2:
-
-                left_candidates.append(x_bottom)
-
-                cv2.line(
-                    roi,
-                    (x1, y1),
-                    (x2, y2),
-                    (0, 255, 0),
-                    3
-                )
-
-            # =================================
-            # 오른쪽 차선
-            # =================================
-            else:
-
-                right_candidates.append(x_bottom)
-
-                cv2.line(
-                    roi,
-                    (x1, y1),
-                    (x2, y2),
-                    (0, 0, 255),
-                    3
-                )
-
-        # =====================================
-        # 차선 부족
-        # =====================================
-        if len(left_candidates) == 0:
-            return self.prev_angle
-
-        if len(right_candidates) == 0:
-            return self.prev_angle
-
-        # =====================================
-        # 가장 바깥쪽 차선 선택
-        # =====================================
-        left_lane = min(left_candidates)
-
-        right_lane = max(right_candidates)
-
-        # =====================================
-        # 차선 중앙
-        # =====================================
-        lane_center = (left_lane + right_lane) // 2
-
-        # =====================================
-        # 차량 목표 중앙
-        # =====================================
-        target = roi_w // 2
-
-        # =====================================
-        # 오차 계산
-        # =====================================
+        # error
         error = target - lane_center
 
-        # =====================================
         # PID
-        # =====================================
-        kp = 0.55
-        kd = 0.20
-        ki = 0.0005
+        kp = 0.40
+        kd = 0.12
+        ki = 0.0003
 
         self.integral += error
 
@@ -304,9 +359,7 @@ class TrackDriverNode(Node):
 
         self.prev_error = error
 
-        # =====================================
         # smoothing
-        # =====================================
         angle = (
             0.7 * self.prev_angle +
             0.3 * angle
@@ -314,60 +367,30 @@ class TrackDriverNode(Node):
 
         self.prev_angle = angle
 
-        # =====================================
-        # steering 제한
-        # =====================================
+        # limit
         angle = max(min(angle, 50), -50)
 
-        # =====================================
-        # 디버그 표시
-        # =====================================
-        cv2.circle(
-            roi,
-            (left_lane, roi_h - 20),
-            8,
-            (255, 255, 255),
-            -1
-        )
-
-        cv2.circle(
-            roi,
-            (right_lane, roi_h - 20),
-            8,
-            (0, 255, 255),
-            -1
-        )
-
-        cv2.circle(
-            roi,
-            (lane_center, roi_h - 40),
-            10,
-            (255, 0, 0),
-            -1
-        )
-
+        # debug
         cv2.line(
-            roi,
-            (target, 0),
-            (target, roi_h),
-            (0, 255, 0),
+            out_img,
+            (320, 0),
+            (320, 480),
+            (0, 255, 255),
             2
         )
 
-        cv2.imshow("mask", mask)
-        cv2.imshow("edges", edges)
-        cv2.imshow("lane_roi", roi)
+        cv2.imshow("bev", bev)
+        cv2.imshow("binary", binary)
+        cv2.imshow("sliding_window", out_img)
 
-        print("left_lane  :", left_lane)
-        print("right_lane :", right_lane)
         print("lane_center:", lane_center)
-        print("error      :", error)
-        print("angle      :", angle)
+        print("error:", error)
+        print("angle:", angle)
 
         return angle
 
     # =========================================
-    # 메인 루프
+    # main loop
     # =========================================
     def main_loop(self):
 
@@ -385,13 +408,13 @@ class TrackDriverNode(Node):
 
             angle = self.lane_driving(frame)
 
-            # 속도 제어
+            # speed control
             speed = 4
 
-            if abs(angle) > 15:
+            if abs(angle) > 20:
                 speed = 3
 
-            if abs(angle) > 30:
+            if abs(angle) > 35:
                 speed = 2
 
             self.drive(angle, speed)
@@ -402,7 +425,7 @@ class TrackDriverNode(Node):
                 break
 
     # =========================================
-    # 종료
+    # destroy
     # =========================================
     def destroy(self):
 
