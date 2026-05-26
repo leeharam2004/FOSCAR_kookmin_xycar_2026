@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 
 # =============================================
-# ROS2 Xycar Dual Lane Driving
+# ROS2 Xycar Lane Driving
 #
 # 개선 내용
-# 1. 좌우 차선 동시 추적
-# 2. 중앙 점선 오검출 감소
-# 3. 차선 뒤바뀜 방지
-# 4. 코너 반대조향 방지
-# 5. window 순간 점프 방지
-# 6. adaptive PID
+# 1. 더 먼 차선 탐지
+# 2. 커브 조기 인식
+# 3. 오른쪽 실선 기반 2차선 유지
+# 4. 노란 점선 무시 강화
+# 5. 조향 반응 강화
 # =============================================
 
 import rclpy
@@ -31,11 +30,7 @@ class SlideWindow:
 
     def __init__(self):
 
-        self.prev_center = 320
-
-        self.prev_leftx = 160
-
-        self.prev_rightx = 480
+        self.x_previous = 320
 
     def slidewindow(self, img):
 
@@ -51,49 +46,22 @@ class SlideWindow:
         nonzerox = np.array(nonzero[1])
 
         # =====================================
-        # 좌우 영역 분리
+        # 더 넓은 영역으로 시작점 탐색
         # =====================================
-        left_region = img[
-            height - 120:height,
-            :width // 2
-        ]
-
         right_region = img[
             height - 120:height,
-            width // 2:width
+            int(width * 0.55):width
         ]
 
-        # histogram
-        left_histogram = np.sum(
-            left_region,
-            axis=0
-        )
-
-        right_histogram = np.sum(
+        histogram = np.sum(
             right_region,
             axis=0
         )
 
-        # 시작점
-        leftx_current = np.argmax(
-            left_histogram
-        )
-
         rightx_current = (
-            np.argmax(right_histogram)
-            + width // 2
+            np.argmax(histogram)
+            + int(width * 0.55)
         )
-
-        # =====================================
-        # 이전값 기반 안정화
-        # =====================================
-        if abs(leftx_current - self.prev_leftx) > 80:
-
-            leftx_current = self.prev_leftx
-
-        if abs(rightx_current - self.prev_rightx) > 80:
-
-            rightx_current = self.prev_rightx
 
         # =====================================
         # sliding window parameter
@@ -107,8 +75,6 @@ class SlideWindow:
         margin = 70
 
         minpix = 25
-
-        left_lane_inds = []
 
         right_lane_inds = []
 
@@ -125,215 +91,98 @@ class SlideWindow:
                 height - window * window_height
             )
 
-            # left window
-            win_xleft_low = (
-                leftx_current - margin
-            )
-
-            win_xleft_high = (
-                leftx_current + margin
-            )
-
-            # right window
-            win_xright_low = (
+            win_x_low = (
                 rightx_current - margin
             )
 
-            win_xright_high = (
+            win_x_high = (
                 rightx_current + margin
             )
 
-            # draw left
+            # draw window
             cv2.rectangle(
                 out_img,
-                (win_xleft_low, win_y_low),
-                (win_xleft_high, win_y_high),
+                (win_x_low, win_y_low),
+                (win_x_high, win_y_high),
                 (255, 0, 0),
                 2
             )
 
-            # draw right
-            cv2.rectangle(
-                out_img,
-                (win_xright_low, win_y_low),
-                (win_xright_high, win_y_high),
-                (0, 255, 0),
-                2
-            )
-
-            # left lane pixels
-            good_left_inds = (
+            # lane pixels
+            good_inds = (
                 (
                     (nonzeroy >= win_y_low) &
                     (nonzeroy < win_y_high) &
-                    (nonzerox >= win_xleft_low) &
-                    (nonzerox < win_xleft_high)
+                    (nonzerox >= win_x_low) &
+                    (nonzerox < win_x_high)
                 ).nonzero()[0]
-            )
-
-            # right lane pixels
-            good_right_inds = (
-                (
-                    (nonzeroy >= win_y_low) &
-                    (nonzeroy < win_y_high) &
-                    (nonzerox >= win_xright_low) &
-                    (nonzerox < win_xright_high)
-                ).nonzero()[0]
-            )
-
-            left_lane_inds.append(
-                good_left_inds
             )
 
             right_lane_inds.append(
-                good_right_inds
+                good_inds
             )
 
-            # =================================
-            # left window 이동 제한
-            # =================================
-            if len(good_left_inds) > minpix:
+            # 다음 윈도우 위치 이동
+            if len(good_inds) > minpix:
 
-                new_leftx = int(
+                rightx_current = int(
                     np.mean(
-                        nonzerox[good_left_inds]
+                        nonzerox[good_inds]
                     )
                 )
-
-                if abs(new_leftx - leftx_current) < 50:
-
-                    leftx_current = new_leftx
-
-            # =================================
-            # right window 이동 제한
-            # =================================
-            if len(good_right_inds) > minpix:
-
-                new_rightx = int(
-                    np.mean(
-                        nonzerox[good_right_inds]
-                    )
-                )
-
-                if abs(new_rightx - rightx_current) < 50:
-
-                    rightx_current = new_rightx
 
         # concatenate
-        left_lane_inds = np.concatenate(
-            left_lane_inds
-        )
-
         right_lane_inds = np.concatenate(
             right_lane_inds
         )
 
         # =====================================
-        # 차선 계산
+        # 차선 못 찾으면 이전값 유지
         # =====================================
-        leftx = None
+        if len(right_lane_inds) == 0:
 
-        rightx = None
+            return out_img, self.x_previous
 
-        if len(left_lane_inds) > 0:
-
-            leftx = int(
-                np.mean(
-                    nonzerox[left_lane_inds]
-                )
+        # =====================================
+        # 가장 오른쪽 픽셀 사용
+        # =====================================
+        rightx = int(
+            np.max(
+                nonzerox[right_lane_inds]
             )
-
-        if len(right_lane_inds) > 0:
-
-            rightx = int(
-                np.mean(
-                    nonzerox[right_lane_inds]
-                )
-            )
+        )
 
         # =====================================
-        # 차선 뒤바뀜 방지
+        # 2차선 중심 계산
         # =====================================
-        if (
-            leftx is not None and
-            rightx is not None
-        ):
+        lane_width_offset = 240
 
-            if leftx > rightx:
+        x_location = (
+            rightx - lane_width_offset
+        )
 
-                lane_center = self.prev_center
-
-                return out_img, lane_center
-
-        # =====================================
-        # 차선 중앙 계산
-        # =====================================
-        if (
-            leftx is not None and
-            rightx is not None
-        ):
-
-            lane_center = int(
-                (leftx + rightx) / 2
-            )
-
-        elif leftx is not None:
-
-            lane_center = leftx + 240
-
-        elif rightx is not None:
-
-            lane_center = rightx - 240
-
-        else:
-
-            lane_center = self.prev_center
-
-        # =====================================
-        # 이전값 저장
-        # =====================================
-        self.prev_center = lane_center
-
-        if leftx is not None:
-
-            self.prev_leftx = leftx
-
-        if rightx is not None:
-
-            self.prev_rightx = rightx
+        self.x_previous = x_location
 
         # =====================================
         # debug
         # =====================================
-        if leftx is not None:
-
-            cv2.circle(
-                out_img,
-                (leftx, height - 20),
-                10,
-                (255, 255, 0),
-                -1
-            )
-
-        if rightx is not None:
-
-            cv2.circle(
-                out_img,
-                (rightx, height - 20),
-                10,
-                (0, 255, 255),
-                -1
-            )
+        cv2.circle(
+            out_img,
+            (rightx, height - 20),
+            10,
+            (0, 255, 255),
+            -1
+        )
 
         cv2.circle(
             out_img,
-            (lane_center, height - 40),
+            (x_location, height - 40),
             10,
             (0, 0, 255),
             -1
         )
 
-        return out_img, lane_center
+        return out_img, x_location
 
 
 # =============================================
@@ -376,11 +225,11 @@ class TrackDriverNode(Node):
         )
 
         self.get_logger().info(
-            "===== Stable Dual Lane Driving ====="
+            "===== Enhanced Lane Driving Start ====="
         )
 
     # =========================================
-    # camera callback
+    # callback
     # =========================================
     def cam_callback(self, data):
 
@@ -412,13 +261,15 @@ class TrackDriverNode(Node):
             cv2.COLOR_BGR2HSV
         )
 
+        # =====================================
         # white lane
+        # =====================================
         lower_white = np.array([
             0, 0, 150
         ])
 
         upper_white = np.array([
-            180, 90, 255
+            180, 80, 255
         ])
 
         white_mask = cv2.inRange(
@@ -427,7 +278,9 @@ class TrackDriverNode(Node):
             upper_white
         )
 
+        # =====================================
         # yellow lane
+        # =====================================
         lower_yellow = np.array([
             10, 80, 80
         ])
@@ -474,44 +327,46 @@ class TrackDriverNode(Node):
     # =========================================
     def lane_driving(self, frame):
 
-        # ROI
+        # =====================================
+        # 더 먼 차선까지 보도록 ROI 확대
+        # =====================================
         roi = frame[
             150:480,
             :
         ]
 
-        # binary
+        # =====================================
+        # binary lane image
+        # =====================================
         binary = self.preprocessing(
             roi
         )
 
+        # =====================================
         # sliding window
+        # =====================================
         out_img, lane_center = (
             self.slidewindow.slidewindow(
                 binary
             )
         )
 
-        # target
+        # =====================================
+        # target center
+        # =====================================
         target = 320
 
+        # =====================================
         # error
+        # =====================================
         error = target - lane_center
 
         # =====================================
-        # adaptive PID
+        # PID
         # =====================================
-        if abs(error) > 40:
+        kp = 1.2
 
-            kp = 1.5
-
-            kd = 0.55
-
-        else:
-
-            kp = 1.1
-
-            kd = 0.4
+        kd = 0.45
 
         ki = 0.0005
 
@@ -530,27 +385,31 @@ class TrackDriverNode(Node):
         self.prev_error = error
 
         # =====================================
-        # smoothing
+        # smoothing 감소
         # =====================================
         angle = (
-            0.2 * self.prev_angle +
-            0.8 * angle
+            0.1 * self.prev_angle +
+            0.9 * angle
         )
 
         self.prev_angle = angle
 
+        # =====================================
         # steering limit
+        # =====================================
         angle = max(
             min(angle, 90),
             -90
         )
 
+        # =====================================
         # debug
+        # =====================================
         cv2.line(
             out_img,
             (target, 0),
             (target, out_img.shape[0]),
-            (0, 0, 255),
+            (0, 255, 0),
             2
         )
 
@@ -565,6 +424,7 @@ class TrackDriverNode(Node):
         )
 
         print("lane_center:", lane_center)
+        print("target:", target)
         print("error:", error)
         print("angle:", angle)
 
@@ -591,7 +451,9 @@ class TrackDriverNode(Node):
                 frame
             )
 
+            # =================================
             # speed control
+            # =================================
             speed = 4
 
             if abs(angle) > 25:
