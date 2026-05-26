@@ -4,11 +4,12 @@
 # =============================================
 # ROS2 Xycar Lane Driving
 #
-# 수정 내용
-# 1. 오른쪽 실선 기반 2차선 주행
-# 2. 오른쪽 쏠림 해결
-# 3. 노란 점선 무시 강화
-# 4. 커브 조향 강화
+# 개선 내용
+# 1. 더 먼 차선 탐지
+# 2. 커브 조기 인식
+# 3. 오른쪽 실선 기반 2차선 유지
+# 4. 노란 점선 무시 강화
+# 5. 조향 반응 강화
 # =============================================
 
 import rclpy
@@ -45,10 +46,10 @@ class SlideWindow:
         nonzerox = np.array(nonzero[1])
 
         # =====================================
-        # 오른쪽 영역만 사용
+        # 더 넓은 영역으로 시작점 탐색
         # =====================================
         right_region = img[
-            height - 60:height,
+            height - 120:height,
             int(width * 0.55):width
         ]
 
@@ -57,7 +58,6 @@ class SlideWindow:
             axis=0
         )
 
-        # 시작점
         rightx_current = (
             np.argmax(histogram)
             + int(width * 0.55)
@@ -66,13 +66,13 @@ class SlideWindow:
         # =====================================
         # sliding window parameter
         # =====================================
-        nwindows = 8
+        nwindows = 12
 
         window_height = int(
             height / nwindows
         )
 
-        margin = 50
+        margin = 70
 
         minpix = 25
 
@@ -108,7 +108,7 @@ class SlideWindow:
                 2
             )
 
-            # lane pixel
+            # lane pixels
             good_inds = (
                 (
                     (nonzeroy >= win_y_low) &
@@ -122,7 +122,7 @@ class SlideWindow:
                 good_inds
             )
 
-            # 다음 window 이동
+            # 다음 윈도우 위치 이동
             if len(good_inds) > minpix:
 
                 rightx_current = int(
@@ -137,7 +137,7 @@ class SlideWindow:
         )
 
         # =====================================
-        # 차선 못 찾으면 이전값
+        # 차선 못 찾으면 이전값 유지
         # =====================================
         if len(right_lane_inds) == 0:
 
@@ -153,7 +153,7 @@ class SlideWindow:
         )
 
         # =====================================
-        # 2차선 중심
+        # 2차선 중심 계산
         # =====================================
         lane_width_offset = 240
 
@@ -225,7 +225,7 @@ class TrackDriverNode(Node):
         )
 
         self.get_logger().info(
-            "===== Lane Driving Start ====="
+            "===== Enhanced Lane Driving Start ====="
         )
 
     # =========================================
@@ -261,7 +261,9 @@ class TrackDriverNode(Node):
             cv2.COLOR_BGR2HSV
         )
 
-        # 흰색
+        # =====================================
+        # white lane
+        # =====================================
         lower_white = np.array([
             0, 0, 150
         ])
@@ -276,7 +278,9 @@ class TrackDriverNode(Node):
             upper_white
         )
 
-        # 노란색
+        # =====================================
+        # yellow lane
+        # =====================================
         lower_yellow = np.array([
             10, 80, 80
         ])
@@ -309,6 +313,7 @@ class TrackDriverNode(Node):
             kernel
         )
 
+        # blur
         mask = cv2.GaussianBlur(
             mask,
             (5, 5),
@@ -322,18 +327,24 @@ class TrackDriverNode(Node):
     # =========================================
     def lane_driving(self, frame):
 
-        # ROI
+        # =====================================
+        # 더 먼 차선까지 보도록 ROI 확대
+        # =====================================
         roi = frame[
-            250:480,
+            150:480,
             :
         ]
 
-        # binary lane
+        # =====================================
+        # binary lane image
+        # =====================================
         binary = self.preprocessing(
             roi
         )
 
+        # =====================================
         # sliding window
+        # =====================================
         out_img, lane_center = (
             self.slidewindow.slidewindow(
                 binary
@@ -341,7 +352,7 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # target
+        # target center
         # =====================================
         target = 320
 
@@ -351,11 +362,11 @@ class TrackDriverNode(Node):
         error = target - lane_center
 
         # =====================================
-        # PID 강화
+        # PID
         # =====================================
-        kp = 1.1
+        kp = 1.2
 
-        kd = 0.4
+        kd = 0.45
 
         ki = 0.0005
 
@@ -377,8 +388,8 @@ class TrackDriverNode(Node):
         # smoothing 감소
         # =====================================
         angle = (
-            0.15 * self.prev_angle +
-            0.85 * angle
+            0.1 * self.prev_angle +
+            0.9 * angle
         )
 
         self.prev_angle = angle
@@ -413,11 +424,8 @@ class TrackDriverNode(Node):
         )
 
         print("lane_center:", lane_center)
-
         print("target:", target)
-
         print("error:", error)
-
         print("angle:", angle)
 
         return angle
