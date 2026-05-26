@@ -155,7 +155,7 @@ class SlideWindow:
         # =====================================
         # 2차선 중심 계산
         # =====================================
-        lane_width_offset = 400
+        lane_width_offset = 260
 
         x_location = (
             rightx - lane_width_offset
