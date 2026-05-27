@@ -64,8 +64,9 @@ class OrangeDetection(Node):
         msg.data = pixel_count > 100   # 픽셀 10000개 이상이면 주황색 있음
         self.is_orange_pub.publish(msg)
 
-        cv2.imshow('Orange Mask', mask)
-        cv2.waitKey(1)
+        # 시각화
+        # cv2.imshow('Orange Mask', mask)
+        # cv2.waitKey(1)
 
         # self.get_logger().info(f'orange pixels: {pixel_count}')
 
