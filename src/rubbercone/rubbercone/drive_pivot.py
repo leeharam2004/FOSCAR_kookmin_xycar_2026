@@ -145,6 +145,12 @@ class DrivePivot(Node):
         self.leftCones.cones  = self._pad_to_5(left_cones)
         self.rightCones.cones = self._pad_to_5(right_cones)
 
+        self.get_logger().info(
+            f'left_cones={len(left_cones)} right_cones={len(right_cones)} ' \
+            f'leftPivot=({self.leftPivot.centerX:.2f},{self.leftPivot.centerY:.2f}) ' \
+            f'rightPivot=({self.rightPivot.centerX:.2f},{self.rightPivot.centerY:.2f})'
+        )
+
     def _pad_to_5(self, cones):
         if len(cones) < 5:
             last = cones[-1]
@@ -166,10 +172,18 @@ class DrivePivot(Node):
         x_vals = np.array(x_vals)
         y_vals = np.array(y_vals)
 
+        self.get_logger().info(
+            f'x_vals={x_vals.tolist()} y_vals={y_vals.tolist()} ' \
+            f'left_count={len(self.leftCones.cones)} right_count={len(self.rightCones.cones)}'
+        )
+
         active    = False
         angle_deg = 0.0
 
         if len(set(x_vals)) == 1:
+            self.get_logger().warn(
+                'All mid_x values equal; likely insufficient distinct cones or duplicate padding.'
+            )
             angle_deg = 0.0
             active    = False
         elif not self.is_orange:
