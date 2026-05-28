@@ -402,6 +402,8 @@ class TrackDriverNode(Node):
             -90
         )
 
+        angle *= -1
+
         # =====================================
         # debug
         # =====================================
@@ -454,7 +456,7 @@ class TrackDriverNode(Node):
             # =================================
             # speed control
             # =================================
-            speed = 4
+            speed = 6
 
             if abs(angle) > 25:
 
