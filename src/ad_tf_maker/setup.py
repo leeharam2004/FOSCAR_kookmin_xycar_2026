@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'tf_static_translator'
+package_name = 'ad_tf_maker'
 
 setup(
     name=package_name,
@@ -24,8 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'translator = tf_static_translator.translator:main',
-            'lidar_translator = tf_static_translator.lidar_translator:main'
+            'dead_reckoning = ad_tf_maker.dead_reckoning:main'
         ],
     },
 )

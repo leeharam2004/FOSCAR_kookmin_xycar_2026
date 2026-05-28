@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'tf_maker'
+package_name = 'ad_translator'
 
 setup(
     name=package_name,
@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'tf_tester = tf_maker.tf_tester:main'
+            'tf_translator = ad_translator.tf_translator:main',
+            'lidar_translator = ad_translator.lidar_translator:main'
         ],
     },
 )
