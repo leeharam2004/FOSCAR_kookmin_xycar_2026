@@ -93,12 +93,12 @@ class SlideWindow:
                 height - window * window_height
             )
 
-            win_x_low = (
-                rightx_current - margin
+            win_x_low = max(
+                rightx_current - margin, int(width * 0.45)
             )
 
-            win_x_high = (
-                rightx_current + margin
+            win_x_high = min(
+                rightx_current + margin, width - 1
             )
 
             # draw window
