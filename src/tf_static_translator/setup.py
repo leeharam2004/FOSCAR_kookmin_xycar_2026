@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'translator = tf_static_translator.translator:main'
+            'translator = tf_static_translator.translator:main',
+            'lidar_translator = tf_static_translator.lidar_translator:main'
         ],
     },
 )
