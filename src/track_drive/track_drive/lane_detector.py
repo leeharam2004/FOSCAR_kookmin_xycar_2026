@@ -35,7 +35,7 @@ class CamViewerNode(Node):
         cv2.imshow("Front View", f)
         cv2.waitKey(1)
 
-class 
+
 
 def main(args=None):
     rclpy.init(args=args)
