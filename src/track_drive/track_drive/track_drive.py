@@ -469,9 +469,7 @@ class TrackDriverNode(Node):
             speed = 4                        # 6 → 4
             if max_recent > 20: speed = 3
             if max_recent > 40: speed = 2
-
-            self.drive(angle, speed)
-            
+            self.drive(angle, speed) 
             cv2.imshow(
                 "camera",
                 frame
