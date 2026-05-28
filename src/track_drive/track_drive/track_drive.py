@@ -509,7 +509,7 @@ def main(args=None):
 
     finally:
 
-        node.destroy()
+        node.destroy(
 
         rclpy.shutdown()
 
