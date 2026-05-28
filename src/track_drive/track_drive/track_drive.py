@@ -2,6 +2,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #아오 커밋어떻게해
+#아직도 안
 # =============================================
 # ROS2 Xycar Lane Driving
 #
@@ -469,6 +470,8 @@ class TrackDriverNode(Node):
             if max_recent > 20: speed = 3
             if max_recent > 40: speed = 2
 
+            self.drive(angle, speed)
+            
             cv2.imshow(
                 "camera",
                 frame
