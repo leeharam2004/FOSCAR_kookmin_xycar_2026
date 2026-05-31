@@ -26,7 +26,7 @@ class Translator(Node):
     
     def tl_callback(self, data):
         # if rclpy.ok:
-        data.ranges = [r if r > 0.9 else float('inf') for r in data.ranges]
+        data.ranges = [r if (r > 0.9 and r < 25) else float('inf') for r in data.ranges]
         self.pub.publish(data)
         
 def main(args=None):

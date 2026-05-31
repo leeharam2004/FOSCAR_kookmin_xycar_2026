@@ -1,43 +1,90 @@
 amcl:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED] /clock 토픽이 없으므로 false 설정
     alpha1: 0.2
     alpha2: 0.2
     alpha3: 0.2
     alpha4: 0.2
     alpha5: 0.2
-    global_frame_id: "ad/map"     # [AD_MODIFIED] map -> ad/map
-    base_frame_id: "ad/base_link" # [AD_MODIFIED] base_footprint 대신 ad/base_link 사용
-    odom_frame_id: "ad/odom"      # [AD_MODIFIED] odom -> ad/odom
-    scan_topic: "/ad/scan"        # [AD_MODIFIED] scan -> /ad/scan
+    base_frame_id: "ad/base_link"
+    introspection_mode: "disabled"
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
     do_beamskip: false
+    global_frame_id: "ad/map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
-    laser_max_range: 100.0
+    laser_likelihood_max_dist: 4.0   # 2.0 -> 4.0 (점 장애물 주변 탐색 범위 확대)    laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 60
-    max_particles: 2000
-    min_particles: 500
-    pf_err: 0.05
+    max_beams: 180                  # 60 -> 180 (얇은 고깔을 놓치지 않도록 레이저 빔 샘플링 증가)
+    max_particles: 4000             # 2000 -> 4000
+    min_particles: 1000             # 500 -> 1000 (데이터가 부족하므로 더 많은 후보군 유지)
+    odom_frame_id: "ad/odom"
+    pf_err: 0.1                     # 0.05 -> 0.1 (약간의 위치 오차를 허용하여 튐 방지)
     pf_z: 0.99
+    random_seed: -1
     recovery_alpha_fast: 0.0
     recovery_alpha_slow: 0.0
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.2
+    sigma_hit: 0.5                  # 0.2 -> 0.5 (장애물 매칭 확률 분포를 넓게 잡음)
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.2
-    update_min_d: 0.25
-    z_hit: 0.5
+    update_min_a: 0.03
+    update_min_d: 0.03
+    z_hit: 0.9
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.05
     z_short: 0.05
+    scan_topic: "/ad/scan"
+    map_topic: map
+    set_initial_pose: false
+    always_reset_initial_pose: false
+    first_map_only: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+    # use_sim_time: false # [AD_MODIFIED] /clock 토픽이 없으므로 false 설정
+    # alpha1: 0.2
+    # alpha2: 0.2
+    # alpha3: 0.2
+    # alpha4: 0.2
+    # alpha5: 0.2
+    # global_frame_id: "ad/map"     # [AD_MODIFIED] map -> ad/map
+    # base_frame_id: "ad/base_link" # [AD_MODIFIED] base_footprint 대신 ad/base_link 사용
+    # odom_frame_id: "ad/odom"      # [AD_MODIFIED] odom -> ad/odom
+    # scan_topic: "/ad/scan"        # [AD_MODIFIED] scan -> /ad/scan
+    # beam_skip_distance: 0.5
+    # beam_skip_error_threshold: 0.9
+    # beam_skip_threshold: 0.3
+    # do_beamskip: true
+    # lambda_short: 0.1
+    # laser_likelihood_max_dist: 2.0
+    # laser_max_range: 44.0
+    # laser_min_range: -1.0
+    # laser_model_type: "likelihood_field"
+    # max_beams: 60
+    # max_particles: 2000
+    # min_particles: 5
+    # pf_err: 0.05
+    # pf_z: 0.99
+    # recovery_alpha_fast: 0.0
+    # recovery_alpha_slow: 0.0
+    # resample_interval: 1
+    # robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    # save_pose_rate: 0.5
+    # sigma_hit: 0.2
+    # tf_broadcast: true
+    # transform_tolerance: 1.0
+    # update_min_a: 0.2
+    # update_min_d: 0.25
+    # z_hit: 0.5
+    # z_max: 0.05
+    # z_rand: 0.5
+    # z_short: 0.05
 
 bt_navigator:
   ros__parameters:
@@ -142,7 +189,7 @@ controller_server:
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.26
+      max_vel_x: 0.03
       max_vel_y: 0.0
       max_vel_theta: 1.0
       min_speed_xy: 0.0

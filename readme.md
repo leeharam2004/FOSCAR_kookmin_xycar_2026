@@ -39,6 +39,14 @@ source install/setup.bash
 ros2 launch track_drive bringup.launch.py
 ```
 
+일단 한 반쯤은 되게 만들었어용
+
+저 launch 한 후에
+ad_translator 패키지의 motor_translator 실행시켜주고
+rviz2에서 tf에다가 ad/map이라고 쓰고 기본 pose estimate 해준다음에 goal estimate 설정해주면 가려고 하는데
+**아직 mapping이 제대로 안되는지 얼마 지나서 map의 좌표가 완전히 부정확해집니다 ㅠㅠ**
+일단 저녁에 또 해볼예정!
+
 ### 2. 주요 설정 및 주의사항
 
 * **중요!!!!!!!!!!!!!!!:** 시뮬레이터에서 차량을 움직일 때 `kookmin9_viewer`를 사용해야 합니다. 키보드로 움직이는 경우 Speed값을 코드가 받아올 수 없어 움직임을 인식하지 못합니다.
