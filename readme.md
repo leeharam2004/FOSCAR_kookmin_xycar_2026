@@ -43,7 +43,7 @@ ros2 launch track_drive bringup.launch.py
 
 * **네임스페이스:** 모든 데이터는 `ad/` 네임스페이스를 사용하도록 설정되어 있습니다. (예: `/ad/scan`, `/ad/odom`)
 * **Time Mode:** 현재 `/clock` 토픽이 없는 환경에 맞춰 `use_sim_time:=False`로 설정되어 있습니다. 시뮬레이션 렉이 심할 경우 주의가 필요합니다.
-* **라이다 필터:** 로봇 차체 간섭을 피하기 위해 센서 위치가 조정되어 있습니다. (Static TF 확인)
+* **라이다 필터:** 로봇 차체 간섭을 피하기 위해 센서 위치가 조정되어 있습니다. (`static_tf_node` 확인)
 
 ## 📂 폴더 구조
 
@@ -56,3 +56,18 @@ ros2 launch track_drive bringup.launch.py
 ### 💡 팀원들에게 전하는 팁
 
 1. AI 좋네요
+
+## 사용하는 토픽 리스트
+
+```
+--사용하는 토픽 리스트--
+/ad/odom
+/ad/scan
+/imu
+/tf
+/tf_static
+--사용할 map 파일--
+os.path.join(pkg_share, 'config', 'my_map.yaml')
+--tf tree--
+ad/map -> ad/odom -> ad/base_link -> lidar_frame
+```

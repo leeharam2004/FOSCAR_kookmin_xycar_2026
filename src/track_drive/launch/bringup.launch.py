@@ -50,10 +50,13 @@ def generate_launch_description():
     # 5. Nav2 (가져온 지도 파일과 함께 실행)
     nav2_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
-            os.path.join(get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')
+            os.path.join(get_package_share_directory('nav2_bringup'), 'launch', 'bringup_launch.py')
         ]),
         launch_arguments={
-            'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml')
+            'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml'),
+            'slam': 'False',
+            'use_sim_time': 'False',
+            'map': os.path.join(pkg_share, 'config', 'my_map.yaml'), # 이 부분이 중요!
         }.items()
     )
 
@@ -61,6 +64,6 @@ def generate_launch_description():
         dead_reckoning_node,
         lidar_translate_node,
         static_tf_node,
-        slam_toolbox_launch,
-        # nav2_launch
+        # slam_toolbox_launch,
+        nav2_launch
     ])

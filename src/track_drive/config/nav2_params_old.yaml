@@ -1,19 +1,17 @@
 amcl:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED] /clock 토픽이 없으므로 false 설정
+    use_sim_time: True
     alpha1: 0.2
     alpha2: 0.2
     alpha3: 0.2
     alpha4: 0.2
     alpha5: 0.2
-    global_frame_id: "ad/map"     # [AD_MODIFIED] map -> ad/map
-    base_frame_id: "ad/base_link" # [AD_MODIFIED] base_footprint 대신 ad/base_link 사용
-    odom_frame_id: "ad/odom"      # [AD_MODIFIED] odom -> ad/odom
-    scan_topic: "/ad/scan"        # [AD_MODIFIED] scan -> /ad/scan
+    base_frame_id: "base_footprint"
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
     do_beamskip: false
+    global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
     laser_max_range: 100.0
@@ -22,6 +20,7 @@ amcl:
     max_beams: 60
     max_particles: 2000
     min_particles: 500
+    odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
     recovery_alpha_fast: 0.0
@@ -38,13 +37,14 @@ amcl:
     z_max: 0.05
     z_rand: 0.5
     z_short: 0.05
+    scan_topic: scan
 
 bt_navigator:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED]
-    global_frame: "ad/map"        # [AD_MODIFIED]
-    robot_base_frame: "ad/base_link" # [AD_MODIFIED]
-    odom_topic: "/ad/odom"        # [AD_MODIFIED] odom -> /ad/odom
+    use_sim_time: True
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
@@ -103,14 +103,15 @@ bt_navigator:
 
 bt_navigator_navigate_through_poses_rclcpp_node:
   ros__parameters:
-    use_sim_time: False # [AD_MODIFIED]
+    use_sim_time: True
 
 bt_navigator_navigate_to_pose_rclcpp_node:
   ros__parameters:
-    use_sim_time: False # [AD_MODIFIED]
+    use_sim_time: True
+
 controller_server:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED]
+    use_sim_time: True
     controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
@@ -184,19 +185,19 @@ local_costmap:
     ros__parameters:
       update_frequency: 5.0
       publish_frequency: 2.0
-      global_frame: "ad/odom"        # [AD_MODIFIED] 로컬 코스트맵 기준은 ad/odom
-      robot_base_frame: "ad/base_link" # [AD_MODIFIED]
-      use_sim_time: false # [AD_MODIFIED]
+      global_frame: odom
+      robot_base_frame: base_link
+      use_sim_time: True
       rolling_window: true
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.40 # [AD_MODIFIED] 실제 로봇 크기에 맞춰 넉넉하게 수정 (기존 0.22)
+      robot_radius: 0.22
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7 # [AD_MODIFIED] 장애물에서 떨어질 안전 거리 (로봇 반지름보다 커야 함)
+        inflation_radius: 0.55
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -208,7 +209,7 @@ local_costmap:
         mark_threshold: 0
         observation_sources: scan
         scan:
-          topic: "/ad/scan" # [AD_MODIFIED]
+          topic: /scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -227,10 +228,10 @@ global_costmap:
     ros__parameters:
       update_frequency: 1.0
       publish_frequency: 1.0
-      global_frame: "ad/map"         # [AD_MODIFIED] 글로벌 코스트맵 기준은 ad/map
-      robot_base_frame: "ad/base_link" # [AD_MODIFIED]
-      use_sim_time: false # [AD_MODIFIED]
-      robot_radius: 0.40 # [AD_MODIFIED] 상동
+      global_frame: map
+      robot_base_frame: base_link
+      use_sim_time: True
+      robot_radius: 0.22
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -239,7 +240,7 @@ global_costmap:
         enabled: True
         observation_sources: scan
         scan:
-          topic: "/ad/scan" # [AD_MODIFIED]
+          topic: /scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -254,22 +255,19 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7 # [AD_MODIFIED]
+        inflation_radius: 0.55
       always_send_full_costmap: True
 
 map_server:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED]
+    use_sim_time: True
     # Overridden in launch by the "map" launch configuration or provided default value.
     # To use in yaml, remove the default "map" value in the tb3_simulation_launch.py file & provide full path to map below.
     yaml_filename: ""
 
-    frame_id: "ad/map" # [중요] 지도를 ad/map 프레임으로 발행함
-    topic_name: "/map"
-
 map_saver:
   ros__parameters:
-    use_sim_time: False # [AD_MODIFIED]
+    use_sim_time: True
     save_map_timeout: 5.0
     free_thresh_default: 0.25
     occupied_thresh_default: 0.65
@@ -278,7 +276,7 @@ map_saver:
 planner_server:
   ros__parameters:
     expected_planner_frequency: 20.0
-    use_sim_time: False # [AD_MODIFIED]
+    use_sim_time: True
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
@@ -288,7 +286,7 @@ planner_server:
 
 smoother_server:
   ros__parameters:
-    use_sim_time: False # [AD_MODIFIED]
+    use_sim_time: True
     smoother_plugins: ["simple_smoother"]
     simple_smoother:
       plugin: "nav2_smoother::SimpleSmoother"
@@ -312,10 +310,10 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     assisted_teleop:
       plugin: "nav2_behaviors/AssistedTeleop"
-    global_frame: "ad/map"         # [AD_MODIFIED]
-    robot_base_frame: "ad/base_link" # [AD_MODIFIED]
+    global_frame: odom
+    robot_base_frame: base_link
     transform_tolerance: 0.1
-    use_sim_time: false # [AD_MODIFIED]
+    use_sim_time: true
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
     min_rotational_vel: 0.4
@@ -323,11 +321,11 @@ behavior_server:
 
 robot_state_publisher:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED]
+    use_sim_time: True
 
 waypoint_follower:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED]
+    use_sim_time: True
     loop_rate: 20
     stop_on_failure: false
     waypoint_task_executor_plugin: "wait_at_waypoint"
@@ -338,7 +336,7 @@ waypoint_follower:
 
 velocity_smoother:
   ros__parameters:
-    use_sim_time: false # [AD_MODIFIED]
+    use_sim_time: True
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
@@ -346,7 +344,7 @@ velocity_smoother:
     min_velocity: [-0.26, 0.0, -1.0]
     max_accel: [2.5, 0.0, 3.2]
     max_decel: [-2.5, 0.0, -3.2]
-    odom_topic: "/ad/odom" # [AD_MODIFIED]
+    odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
