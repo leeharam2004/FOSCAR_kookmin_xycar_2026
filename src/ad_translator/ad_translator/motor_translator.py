@@ -14,7 +14,7 @@ class NavToXycarBridge(Node):
         # Nav2는 보통 최대 속도를 1.0m/s 내외로 쏩니다. (가정치)
         # 만약 자이카가 너무 느리게 움직이면 이 SCALE 값을 키우세요.
         self.speed_scale = 30.0  
-        self.angle_scale = 40.0
+        self.angle_scale = 200.0
 
         self.sub_cmd_vel = self.create_subscription(
             Twist,

@@ -1,9 +1,9 @@
 amcl:
   ros__parameters:
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
+    alpha1: 0.3
+    alpha2: 0.3
+    alpha3: 0.3
+    alpha4: 0.3
     alpha5: 0.2
     base_frame_id: "ad/base_link"
     introspection_mode: "disabled"
@@ -13,7 +13,7 @@ amcl:
     do_beamskip: false
     global_frame_id: "ad/map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 4.0   # 2.0 -> 4.0 (점 장애물 주변 탐색 범위 확대)    laser_max_range: 100.0
+    laser_likelihood_max_dist: 20.0   # 2.0 -> 4.0 (점 장애물 주변 탐색 범위 확대)    laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
     max_beams: 180                  # 60 -> 180 (얇은 고깔을 놓치지 않도록 레이저 빔 샘플링 증가)
@@ -28,9 +28,9 @@ amcl:
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.5                  # 0.2 -> 0.5 (장애물 매칭 확률 분포를 넓게 잡음)
+    sigma_hit: 0.1                  # 0.2 -> 0.5 (장애물 매칭 확률 분포를 넓게 잡음)
     tf_broadcast: true
-    transform_tolerance: 1.0
+    transform_tolerance: 0.05
     update_min_a: 0.03
     update_min_d: 0.03
     z_hit: 0.9
@@ -189,7 +189,7 @@ controller_server:
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.03
+      max_vel_x: 0.06
       max_vel_y: 0.0
       max_vel_theta: 1.0
       min_speed_xy: 0.0
@@ -215,11 +215,11 @@ controller_server:
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
+      BaseObstacle.scale: 1.0
       PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
+      PathAlign.forward_point_distance: 0.05
       GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
+      GoalAlign.forward_point_distance: 0.05
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
@@ -238,12 +238,12 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.40 # [AD_MODIFIED] 실제 로봇 크기에 맞춰 넉넉하게 수정 (기존 0.22)
+      robot_radius: 0.50 # [AD_MODIFIED] 실제 로봇 크기에 맞춰 넉넉하게 수정 (기존 0.22)
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7 # [AD_MODIFIED] 장애물에서 떨어질 안전 거리 (로봇 반지름보다 커야 함)
+        inflation_radius: 1.3 # [AD_MODIFIED] 장애물에서 떨어질 안전 거리 (로봇 반지름보다 커야 함)
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -277,7 +277,7 @@ global_costmap:
       global_frame: "ad/map"         # [AD_MODIFIED] 글로벌 코스트맵 기준은 ad/map
       robot_base_frame: "ad/base_link" # [AD_MODIFIED]
       use_sim_time: false # [AD_MODIFIED]
-      robot_radius: 0.40 # [AD_MODIFIED] 상동
+      robot_radius: 0.70 # [AD_MODIFIED] 상동
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -301,7 +301,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7 # [AD_MODIFIED]
+        inflation_radius: 1.3 # [AD_MODIFIED]
       always_send_full_costmap: True
 
 map_server:

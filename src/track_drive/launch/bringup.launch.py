@@ -56,7 +56,7 @@ def generate_launch_description():
             'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml'),
             'slam': 'False',
             'use_sim_time': 'False',
-            'map': os.path.join(pkg_share, 'config', 'my_map.yaml'), # 이 부분이 중요!
+            'map': os.path.join(pkg_share, 'config', 'my_map_edited.yaml'), # 이 부분이 중요!
         }.items()
     )
 
