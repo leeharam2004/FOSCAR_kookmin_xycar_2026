@@ -147,7 +147,21 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         self.x = np.cos(self.heading) * self.dist + self.x
         self.y = np.sin(self.heading) * self.dist + self.y
 
-        # --- 1. TF 발행 (odom -> base_link) ---
+        # --- 1. TF 발행 (map -> odom) ---
+        t_map_odom = TransformStamped()
+        t_map_odom.header.stamp = cur_time
+        t_map_odom.header.frame_id = TF_NAMESPACE+'map'
+        t_map_odom.child_frame_id = TF_NAMESPACE+'odom'
+        t_map_odom.transform.translation.x = 0.0
+        t_map_odom.transform.translation.y = 0.0
+        t_map_odom.transform.translation.z = 0.0
+        t_map_odom.transform.rotation.x = 0.0
+        t_map_odom.transform.rotation.y = 0.0
+        t_map_odom.transform.rotation.z = 0.0
+        t_map_odom.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform(t_map_odom)
+
+        # --- 2. TF 발행 (odom -> base_link) ---
         # RViz에서 로봇이 실제로 움직이게 만드는 핵심 부분입니다.
         t = TransformStamped()
         t.header.stamp = cur_time
