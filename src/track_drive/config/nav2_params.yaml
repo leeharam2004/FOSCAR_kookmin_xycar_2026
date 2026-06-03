@@ -39,14 +39,14 @@ amcl:
     z_short: 0.05
     scan_topic: "/ad/scan"
     map_topic: map
-    set_initial_pose: false
+    set_initial_pose: true
     always_reset_initial_pose: false
     first_map_only: false
     initial_pose:
-      x: 0.0
-      y: 0.0
+      x: 13.874
+      y: 1.290
       z: 0.0
-      yaw: 0.0
+      yaw: 0.007
     # use_sim_time: false # [AD_MODIFIED] /clock 토픽이 없으므로 false 설정
     # alpha1: 0.2
     # alpha2: 0.2
