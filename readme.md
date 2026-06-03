@@ -80,5 +80,3 @@ os.path.join(pkg_share, 'config', 'my_map.yaml')
 --tf tree--
 ad/map -> ad/odom -> ad/base_link -> lidar_frame
 ```
-
-commit test
