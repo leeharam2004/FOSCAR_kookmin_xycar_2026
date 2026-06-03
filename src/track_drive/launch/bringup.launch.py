@@ -28,6 +28,14 @@ def generate_launch_description():
         parameters=[]
     )
 
+    # Motor translator node
+    motor_translate_node = Node(
+        package='ad_translator',
+        executable='motor_translator',
+        output='screen',
+        parameters=[]
+    )
+
     # 3. Static TF (base_link -> laser_frame)
     # 나중에 시뮬에서 주는 Static TF로 바꾸기
     static_tf_node = Node(
@@ -63,6 +71,7 @@ def generate_launch_description():
     return LaunchDescription([
         dead_reckoning_node,
         lidar_translate_node,
+        motor_translate_node,
         static_tf_node,
         # slam_toolbox_launch,
         nav2_launch
