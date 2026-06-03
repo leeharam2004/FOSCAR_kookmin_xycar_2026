@@ -119,8 +119,8 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         self.motor_prev_time = self.get_clock().now().nanoseconds / 1e9
         self.speed_sign = 0
 
-        self.x = 0.0
-        self.y = 0.0
+        self.x = 13.874
+        self.y = 1.290
     
     def yaw_to_quaternion(self, yaw: float) -> Quaternion:
         """
