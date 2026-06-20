@@ -1,5 +1,7 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
@@ -97,10 +99,12 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         self.speed = 0.0
         self.dist = 0.0
 
+        self._cb_group = MutuallyExclusiveCallbackGroup()
+
         # Heading(Theta) IMU에서 받아오기
         self.imu_sub = self.create_subscription(
             Imu, SUB_NAMESPACE+"imu", self.imu_callback,
-            qos_profile_system_default
+            qos_profile_system_default, callback_group=self._cb_group
         )
         self.raw_heading = None # 오른쪽으로 90도 틀어져있음
         self.heading = 0.0
@@ -114,13 +118,16 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         #임시!!!!!! 모터 pub에서 방향 추정
         self.speed_sign_check = self.create_subscription(
             XycarMotor, SUB_NAMESPACE+"xycar_motor", self.motor_callback,
-            qos_profile_system_default
+            qos_profile_system_default, callback_group=self._cb_group
         )
         self.motor_prev_time = self.get_clock().now().nanoseconds / 1e9
         self.speed_sign = 0
 
         self.x = 0.0
         self.y = 0.0
+        self.angular_velocity_z = 0.0
+        self.prev_heading = 0.0
+        self.prev_imu_time = None
     
     def yaw_to_quaternion(self, yaw: float) -> Quaternion:
         """
@@ -146,6 +153,7 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         # self.y = np.sin(self.heading) * self.dist * self.speed_sign + self.y
         self.x = np.cos(self.heading) * self.dist + self.x
         self.y = np.sin(self.heading) * self.dist + self.y
+        self.dist = 0.0
 
         # --- 1. TF 발행 (odom -> base_link) ---
         # RViz에서 로봇이 실제로 움직이게 만드는 핵심 부분입니다.
@@ -174,8 +182,17 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         odom.pose.pose.position.y = self.y
         odom.pose.pose.orientation = q
         # 속도 데이터 (Twist)
-        odom.twist.twist.linear.x = self.speed  # 필터링된 속도
-        odom.twist.twist.angular.z = 0.0    # 필요시 IMU의 angular velocity 입력
+        odom.twist.twist.linear.x = self.speed
+        odom.twist.twist.angular.z = self.angular_velocity_z
+
+        # Pose covariance (x, y, yaw diagonal)
+        odom.pose.covariance[0] = 0.2    # x
+        odom.pose.covariance[7] = 0.2    # y
+        odom.pose.covariance[35] = 0.05  # yaw
+
+        # Twist covariance (vx, wz diagonal)
+        odom.twist.covariance[0] = 0.1   # vx
+        odom.twist.covariance[35] = 0.05 # wz
 
         self.odom_pub.publish(odom)
 
@@ -200,7 +217,19 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         # 오른쪽으로 90도 틀어져 있다면, 1.57을 더해서 정면(0)으로 맞춤
         corrected_heading = raw_heading + 1.5708
         self.heading = math.atan2(math.sin(corrected_heading), math.cos(corrected_heading))
-        
+
+        cur_imu_time = self.get_clock().now().nanoseconds / 1e9
+        if self.prev_imu_time is not None:
+            dt = cur_imu_time - self.prev_imu_time
+            if dt > 0:
+                delta = math.atan2(
+                    math.sin(self.heading - self.prev_heading),
+                    math.cos(self.heading - self.prev_heading)
+                )
+                self.angular_velocity_z = delta / dt
+        self.prev_heading = self.heading
+        self.prev_imu_time = cur_imu_time
+
         # self.get_logger().info(f"Heading: {self.heading}")
         # self.get_logger().info(f"Got:         hdg:{self.heading:.1f}")
 
@@ -212,8 +241,8 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         cur_time = data.header.stamp.sec + (data.header.stamp.nanosec / 1e9)
         dt = cur_time - self.motor_prev_time
 
-        self.speed = data.speed / 5.59
-        self.dist = self.speed * dt
+        self.speed = data.speed / 2.5
+        self.dist += self.speed * dt
 
         self.motor_prev_time = cur_time
 
@@ -229,8 +258,10 @@ def main(args=None):
     rclpy.init(args=args)
     node = DeadReckoningNode()
 
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

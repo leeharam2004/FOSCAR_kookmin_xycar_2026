@@ -26,7 +26,8 @@ setup(
         'console_scripts': [
             'tf_translator = ad_translator.tf_translator:main',
             'lidar_translator = ad_translator.lidar_translator:main',
-            'motor_translator = ad_translator.motor_translator:main'
+            'motor_translator = ad_translator.motor_translator:main',
+            'goal_sender = ad_translator.goal_sender:main'
         ],
     },
 )

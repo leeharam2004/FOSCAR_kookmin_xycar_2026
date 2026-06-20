@@ -1,10 +1,10 @@
 amcl:
   ros__parameters:
-    alpha1: 0.3
-    alpha2: 0.3
-    alpha3: 0.3
-    alpha4: 0.3
-    alpha5: 0.2
+    alpha1: 1.0   # rotation noise from rotation — turning is the main error source
+    alpha2: 0.5   # rotation noise from translation
+    alpha3: 0.4   # translation noise from translation
+    alpha4: 1.0   # translation noise from rotation — position drifts badly during turns
+    alpha5: 0.3
     base_frame_id: "ad/base_link"
     introspection_mode: "disabled"
     beam_skip_distance: 0.5
@@ -13,38 +13,39 @@ amcl:
     do_beamskip: false
     global_frame_id: "ad/map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 20.0   # 2.0 -> 4.0 (점 장애물 주변 탐색 범위 확대)    laser_max_range: 100.0
+    laser_likelihood_max_dist: 4.0     # gradient reach — drifted particles can still score and be pulled back
+    laser_max_range: 30.0              # use full lidar range to latch onto distant features
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 180                  # 60 -> 180 (얇은 고깔을 놓치지 않도록 레이저 빔 샘플링 증가)
-    max_particles: 4000             # 2000 -> 4000
-    min_particles: 1000             # 500 -> 1000 (데이터가 부족하므로 더 많은 후보군 유지)
+    max_beams: 180                  # lidar covers front 180° only
+    max_particles: 8000
+    min_particles: 2000
     odom_frame_id: "ad/odom"
-    pf_err: 0.1                     # 0.05 -> 0.1 (약간의 위치 오차를 허용하여 튐 방지)
+    pf_err: 0.05                    # stricter KLD sampling — keeps more particles to track pose
     pf_z: 0.99
     random_seed: -1
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.1        # inject random particles when fast likelihood avg >> slow avg
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
-    sigma_hit: 0.1                  # 0.2 -> 0.5 (장애물 매칭 확률 분포를 넓게 잡음)
+    sigma_hit: 0.1                  # wide enough to score nearby-but-drifted particles, not just exact matches
     tf_broadcast: true
-    transform_tolerance: 0.05
-    update_min_a: 0.03
-    update_min_d: 0.03
-    z_hit: 0.9
-    z_max: 0.05
+    transform_tolerance: 0.1
+    update_min_a: 0.01
+    update_min_d: 0.01
+    z_hit: 0.90
+    z_max: 0.03
     z_rand: 0.05
-    z_short: 0.05
+    z_short: 0.02
     scan_topic: "/ad/scan"
     map_topic: map
     set_initial_pose: true
     always_reset_initial_pose: false
     first_map_only: false
     initial_pose:
-      x: 13.874
-      y: 1.290
+      x: 0.39496
+      y: 0.0365
       z: 0.0
       yaw: 0.007
     # use_sim_time: false # [AD_MODIFIED] /clock 토픽이 없으므로 false 설정
@@ -181,19 +182,19 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 1.0
+      yaw_goal_tolerance: 1.0
     # DWB parameters
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.06
+      max_vel_x: 0.12
       max_vel_y: 0.0
       max_vel_theta: 1.0
       min_speed_xy: 0.0
-      max_speed_xy: 0.26
+      max_speed_xy: 0.52
       min_speed_theta: 0.0
       # Add high threshold velocity for turtlebot 3 issue.
       # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/issues/75
@@ -216,9 +217,9 @@ controller_server:
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       BaseObstacle.scale: 1.0
-      PathAlign.scale: 32.0
+      PathAlign.scale: 16.0
       PathAlign.forward_point_distance: 0.05
-      GoalAlign.scale: 24.0
+      GoalAlign.scale: 12.0
       GoalAlign.forward_point_distance: 0.05
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
@@ -277,7 +278,7 @@ global_costmap:
       global_frame: "ad/map"         # [AD_MODIFIED] 글로벌 코스트맵 기준은 ad/map
       robot_base_frame: "ad/base_link" # [AD_MODIFIED]
       use_sim_time: false # [AD_MODIFIED]
-      robot_radius: 0.70 # [AD_MODIFIED] 상동
+      robot_radius: 1.6 # [AD_MODIFIED] 상동
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -300,7 +301,7 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
+        cost_scaling_factor: 1.5
         inflation_radius: 1.3 # [AD_MODIFIED]
       always_send_full_costmap: True
 
@@ -389,8 +390,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.26, 0.0, 1.0]
-    min_velocity: [-0.26, 0.0, -1.0]
+    max_velocity: [0.52, 0.0, 1.0]
+    min_velocity: [-0.52, 0.0, -1.0]
     max_accel: [2.5, 0.0, 3.2]
     max_decel: [-2.5, 0.0, -3.2]
     odom_topic: "/ad/odom" # [AD_MODIFIED]

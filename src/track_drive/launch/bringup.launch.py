@@ -36,6 +36,14 @@ def generate_launch_description():
         parameters=[]
     )
 
+    # One-shot goal sender — waits for Nav2 action server then sends the fixed goal
+    goal_sender_node = Node(
+        package='ad_translator',
+        executable='goal_sender',
+        output='screen',
+        parameters=[]
+    )
+
     # 3. Static TF (base_link -> laser_frame)
     # 나중에 시뮬에서 주는 Static TF로 바꾸기
     static_tf_node = Node(
@@ -64,7 +72,7 @@ def generate_launch_description():
             'params_file': os.path.join(pkg_share, 'config', 'nav2_params.yaml'),
             'slam': 'False',
             'use_sim_time': 'False',
-            'map': os.path.join(pkg_share, 'config', 'my_map_edited.yaml'), # 이 부분이 중요!
+            'map': os.path.join(pkg_share, 'config', 'map2.yaml'), # 이 부분이 중요!
         }.items()
     )
 
@@ -74,5 +82,6 @@ def generate_launch_description():
         motor_translate_node,
         static_tf_node,
         # slam_toolbox_launch,
-        nav2_launch
+        nav2_launch,
+        goal_sender_node,
     ])
