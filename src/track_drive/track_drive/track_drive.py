@@ -1,75 +1,427 @@
+# -1,521 +1,521 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+#아오 커밋어떻게해
+#아직도 안
 # =============================================
-# Xycar ROS2 자율주행
+# ROS2 Xycar Lane Driving
 #
-# 핵심 수정 사항
-# 1. 차선 "선분 평균" 방식 제거
-# 2. 화면 하단 기준 실제 차선 위치 사용
-# 3. 차선 유지 PID 강화
-# 4. 곡선에서도 차선 유지 가능
-#
-# 트랙 구조
-# [흰 실선] 1차선 [노란 점선] 2차선 [흰 실선]
-#
-# 차량은:
-# 왼쪽 흰 실선 + 중앙 노란 점선 사이
-# (= 1차선)
-# 를 유지하도록 설계
+# 개선 내용
+# 1. 더 먼 차선 탐지
+# 2. 커브 조기 인식
+# 3. 오른쪽 실선 기반 2차선 유지
+# 4. 노란 점선 중앙선 별도 인식
+# 5. 조향 반응 강화
+# 6. 커브길 곡선 2번째 까진 안정적 통과후 직진후 차선이탈 문제
 # =============================================
 
 #commit test
 
 import rclpy
 import cv2
-import time
 import numpy as np
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Int64MultiArray
 from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
 
 
+# =============================================
+# Sliding Window
+# =============================================
+class SlideWindow:
+
+    def __init__(self):
+
+        self.x_previous = 320
+        self.rightx_previous = 580
+        self.rightx_lookahead_previous = 500
+
+    def slidewindow(self, img):
+
+        out_img = np.dstack((img, img, img))
+
+        height = img.shape[0]
+        width = img.shape[1]
+
+        nonzero = img.nonzero()
+
+        nonzeroy = np.array(nonzero[0])
+
+        nonzerox = np.array(nonzero[1])
+
+        # =====================================
+        # 오른쪽 차선 시작점 탐색
+        # 중앙선 오인식을 막기 위해 아래쪽 오른쪽 영역만 사용
+        # =====================================
+        right_search_x = int(width * 0.52)
+
+        right_region = img[
+            int(height * 0.55):height,
+            right_search_x:width
+        ]
+
+        histogram = np.sum(
+            right_region,
+            axis=0
+        )
+
+        if len(histogram) == 0 or np.max(histogram) < 255 * 20:
+
+            rightx_current = int(
+                np.clip(
+                    self.rightx_previous,
+                    right_search_x,
+                    width - 1
+                )
+            )
+
+        else:
+
+            smooth_histogram = np.convolve(
+                histogram,
+                np.ones(9),
+                mode='same'
+            )
+
+            peak_value = np.max(
+                smooth_histogram
+            )
+
+            candidate_x = (
+                np.where(
+                    smooth_histogram > peak_value * 0.35
+                )[0] + right_search_x
+            )
+
+            if len(candidate_x) == 0:
+
+                rightx_current = (
+                    np.argmax(smooth_histogram)
+                    + right_search_x
+                )
+
+            else:
+
+                rightx_current = int(
+                    candidate_x[
+                        np.argmin(
+                            np.abs(candidate_x - self.rightx_previous)
+                        )
+                    ]
+                )
+
+            if abs(rightx_current - self.rightx_previous) > 160:
+
+                rightx_current = int(
+                    0.65 * self.rightx_previous +
+                    0.35 * rightx_current
+                )
+
+            rightx_current = int(
+                np.clip(
+                    rightx_current,
+                    right_search_x,
+                    int(width * 0.93)
+                )
+            )
+
+        # =====================================
+        # sliding window parameter
+        # =====================================
+        nwindows = 12
+
+        window_height = int(
+            height / nwindows
+        )
+
+        margin = 55
+
+        minpix = 25
+
+        right_lane_inds = []
+
+        # =====================================
+        # sliding windows
+        # =====================================
+        for window in range(nwindows):
+
+            win_y_low = (
+                height - (window + 1) * window_height
+            )
+
+            win_y_high = (
+                height - window * window_height
+            )
+
+            # 아래쪽 윈도우는 반드시 오른쪽 차선 영역에서만 찾는다.
+            # 위쪽은 커브를 따라갈 수 있도록 조금 더 열어둔다.
+            if win_y_low > int(height * 0.45):
+
+                min_lane_x = int(width * 0.50)
+
+            else:
+
+                min_lane_x = int(width * 0.30)
+
+            win_x_low = max(
+                rightx_current - margin, min_lane_x
+            )
+
+            win_x_high = min(
+                rightx_current + margin, width - 1
+            )
+
+            # draw window
+            cv2.rectangle(
+                out_img,
+                (win_x_low, win_y_low),
+                (win_x_high, win_y_high),
+                (255, 0, 0),
+                2
+            )
+
+            # lane pixels
+            good_inds = (
+                (
+                    (nonzeroy >= win_y_low) &
+                    (nonzeroy < win_y_high) &
+                    (nonzerox >= win_x_low) &
+                    (nonzerox < win_x_high)
+                ).nonzero()[0]
+            )
+
+            right_lane_inds.append(
+                good_inds
+            )
+
+            # 다음 윈도우 위치 이동
+            if len(good_inds) > minpix:
+
+                rightx_current = int(
+                    np.mean(
+                        nonzerox[good_inds]
+                    )
+                )
+
+        # concatenate
+        if len(right_lane_inds) > 0:
+
+            right_lane_inds = np.concatenate(
+                right_lane_inds
+            )
+
+        # =====================================
+        # 차선 못 찾으면 이전값 유지
+        # =====================================
+        if len(right_lane_inds) == 0:
+
+            return (
+                out_img,
+                self.x_previous,
+                self.rightx_previous,
+                self.rightx_lookahead_previous
+            )
+
+        # =====================================
+        # 중앙선/잡음으로 점프하는 경우 방지
+        # =====================================
+        lane_x = nonzerox[right_lane_inds]
+        lane_y = nonzeroy[right_lane_inds]
+
+        lower_lane = lane_y > int(height * 0.55)
+
+        if np.count_nonzero(lower_lane) < minpix:
+
+            return (
+                out_img,
+                self.x_previous,
+                self.rightx_previous,
+                self.rightx_lookahead_previous
+            )
+
+        lower_median_x = np.median(
+            lane_x[lower_lane]
+        )
+
+        if lower_median_x < int(width * 0.55):
+
+            return (
+                out_img,
+                self.x_previous,
+                self.rightx_previous,
+                self.rightx_lookahead_previous
+            )
+
+        lookahead_y = int(height * 0.42)
+
+        if len(lane_x) >= 50:
+
+            fit = np.polyfit(
+                lane_y,
+                lane_x,
+                2
+            )
+
+            rightx = int(
+                np.polyval(
+                    fit,
+                    height - 1
+                )
+            )
+
+            rightx_lookahead = int(
+                np.polyval(
+                    fit,
+                    lookahead_y
+                )
+            )
+
+        else:
+
+            rightx = int(lower_median_x)
+            rightx_lookahead = rightx
+
+        rightx = int(
+            np.clip(
+                rightx,
+                int(width * 0.55),
+                width - 1
+            )
+        )
+
+        rightx_lookahead = int(
+            np.clip(
+                rightx_lookahead,
+                int(width * 0.30),
+                width - 1
+            )
+        )
+
+        # =====================================
+        # 2차선 중심 계산
+        # =====================================
+        lane_width_offset_bottom = 260
+        lane_width_offset_lookahead = 215
+
+        bottom_center = (
+            rightx - lane_width_offset_bottom
+        )
+
+        lookahead_center = (
+            rightx_lookahead - lane_width_offset_lookahead
+        )
+
+        x_location = int(
+            0.65 * bottom_center +
+            0.35 * lookahead_center
+        )
+
+        if abs(x_location - self.x_previous) > 110:
+
+            x_location = int(
+                0.65 * self.x_previous +
+                0.35 * x_location
+            )
+
+        self.rightx_previous = rightx
+        self.rightx_lookahead_previous = rightx_lookahead
+
+        self.x_previous = x_location
+
+        # =====================================
+        # debug
+        # =====================================
+        cv2.circle(
+            out_img,
+            (rightx, height - 20),
+            10,
+            (0, 255, 255),
+            -1
+        )
+
+        cv2.circle(
+            out_img,
+            (rightx_lookahead, lookahead_y),
+            8,
+            (255, 255, 0),
+            -1
+        )
+
+        cv2.circle(
+            out_img,
+            (x_location, height - 40),
+            10,
+            (0, 0, 255),
+            -1
+        )
+
+        return out_img, x_location, rightx, rightx_lookahead
+
+
+# =============================================
+# ROS2 Node
+# =============================================
 class TrackDriverNode(Node):
 
-    # =========================================
-    # 초기화
-    # =========================================
     def __init__(self):
 
         super().__init__('driver')
 
         self.image = None
-        self.lidar_ranges = None
 
         self.bridge = CvBridge()
 
+        self.slidewindow = SlideWindow()
+
         self.motor_msg = XycarMotor()
+
+        # PID
+        self.prev_error = 0
+
+        self.integral = 0
 
         self.prev_angle = 0
 
-        # =====================================
-        # PID
-        # =====================================
-        self.prev_error = 0
-        self.integral = 0
+        # 직선에서는 속도를 높이고 커브에서는 낮춘다. 속도는 아래
+        # main_loop에서 연속적으로 보간해 급격한 단계 변화를 방지한다.
+        self.straight_speed = 2.5
+        self.curve_speed = 1.0
+        self.current_speed = self.curve_speed
+        self.max_speed_command = self.straight_speed
+        self.publisher_conflict_reported = False
 
-        # =====================================
-        # Publisher
-        # =====================================
+        # 시작 시 정지한다. 초록불이면 주행 상태를 유지하고, 이후
+        # 빨간불이 검출될 때만 다시 정지 상태로 전환한다.
+        self.red_pixel_threshold = 50
+        self.green_pixel_threshold = 30
+        self.red_required_frames = 5
+        self.green_required_frames = 3
+        self.red_frame_count = 0
+        self.green_frame_count = 0
+        self.driving_enabled = False
+
+        self.yellowx_previous = None
+        self.yellow_lookahead_previous = None
+
+        self.yellow_miss_count = 0
+
+        # 노란 왼쪽 경계와 흰색 오른쪽 경계 사이의 차로 폭 추정값이다.
+        # 점선이 잠시 끊겨도 최근 폭을 이용해 차로 중앙을 유지한다.
+        self.lane_width_bottom_estimate = 310.0
+        self.lane_width_lookahead_estimate = 220.0
+
+        # publisher
         self.motor_pub = self.create_publisher(
             XycarMotor,
             'xycar_motor',
             10
         )
 
-        # =====================================
-        # Camera Subscriber
-        # =====================================
+        # subscriber
         self.sub_cam = self.create_subscription(
             Image,
             '/usb_cam/image_raw/front',
@@ -77,20 +429,19 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data
         )
 
-        # =====================================
-        # LiDAR Subscriber
-        # =====================================
-        self.sub_lidar = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.lidar_callback,
-            qos_profile_sensor_data
+        self.traffic_light_sub = self.create_subscription(
+            Int64MultiArray,
+            '/traffic_light',
+            self.traffic_light_callback,
+            10
         )
 
-        self.get_logger().info("===== START =====")
+        self.get_logger().info(
+            "===== Enhanced Lane Driving Start ====="
+        )
 
     # =========================================
-    # 카메라 콜백
+    # callback
     # =========================================
     def cam_callback(self, data):
 
@@ -99,54 +450,86 @@ class TrackDriverNode(Node):
             "bgr8"
         )
 
-    # =========================================
-    # 라이다 콜백
-    # =========================================
-    def lidar_callback(self, msg):
+    def traffic_light_callback(self, message):
 
-        self.lidar_ranges = msg.ranges
+        if len(message.data) < 2:
+            self.red_frame_count = 0
+            self.green_frame_count = 0
+            return
+
+        red_visible = message.data[0] >= self.red_pixel_threshold
+        green_visible = message.data[1] >= self.green_pixel_threshold
+
+        # 빨강과 초록이 동시에 검출되면 초록 주행을 우선한다.
+        if green_visible:
+            self.green_frame_count = min(
+                self.green_frame_count + 1,
+                self.green_required_frames
+            )
+            self.red_frame_count = 0
+
+            if (
+                self.green_frame_count >= self.green_required_frames and
+                not self.driving_enabled
+            ):
+                self.driving_enabled = True
+                self.get_logger().info('GREEN detected: driving enabled')
+        elif red_visible:
+            self.red_frame_count = min(
+                self.red_frame_count + 1,
+                self.red_required_frames
+            )
+            self.green_frame_count = 0
+
+            if (
+                self.red_frame_count >= self.red_required_frames and
+                self.driving_enabled
+            ):
+                self.driving_enabled = False
+                self.get_logger().info('RED detected: vehicle stopped')
+        else:
+            # 신호등이 시야에서 사라져도 현재 주행 상태는 유지한다.
+            self.red_frame_count = 0
+            self.green_frame_count = 0
 
     # =========================================
-    # 차량 제어
+    # drive
     # =========================================
     def drive(self, angle, speed):
 
         self.motor_msg.angle = float(angle)
-        self.motor_msg.speed = float(speed)
 
-        self.motor_pub.publish(self.motor_msg)
+        # 이후 속도 로직이 변경되더라도 직선 최고 속도를 넘지 않는다.
+        self.motor_msg.speed = float(np.clip(
+            speed,
+            -self.max_speed_command,
+            self.max_speed_command
+        ))
+
+        self.motor_pub.publish(
+            self.motor_msg
+        )
 
     # =========================================
-    # 차선 주행
+    # preprocessing
     # =========================================
-    def lane_driving(self, frame):
+    def preprocessing(self, frame):
 
-        height, width, _ = frame.shape
-
-        # =====================================
-        # ROI
-        # 화면 아래만 사용
-        # =====================================
-        roi = frame[
-            int(height * 0.55):height,
-            :
-        ]
-
-        roi_h, roi_w, _ = roi.shape
-
-        # =====================================
-        # HSV 변환
-        # =====================================
         hsv = cv2.cvtColor(
-            roi,
+            frame,
             cv2.COLOR_BGR2HSV
         )
 
         # =====================================
-        # 흰 차선
+        # white lane
         # =====================================
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([255, 70, 255])
+        lower_white = np.array([
+            0, 0, 150
+        ])
+
+        upper_white = np.array([
+            180, 80, 255
+        ])
 
         white_mask = cv2.inRange(
             hsv,
@@ -155,10 +538,15 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 노란 점선
+        # yellow lane
         # =====================================
-        lower_yellow = np.array([15, 80, 80])
-        upper_yellow = np.array([40, 255, 255])
+        lower_yellow = np.array([
+            10, 80, 80
+        ])
+
+        upper_yellow = np.array([
+            40, 255, 255
+        ])
 
         yellow_mask = cv2.inRange(
             hsv,
@@ -166,250 +554,512 @@ class TrackDriverNode(Node):
             upper_yellow
         )
 
-        # =====================================
-        # Blur
-        # =====================================
-        white_mask = cv2.GaussianBlur(
+        height = white_mask.shape[0]
+        width = white_mask.shape[1]
+
+        road_roi = np.zeros_like(
+            white_mask
+        )
+
+        road_polygon = np.array([[
+            (int(width * 0.02), height),
+            (int(width * 0.98), height),
+            (int(width * 0.82), int(height * 0.10)),
+            (int(width * 0.18), int(height * 0.10))
+        ]], np.int32)
+
+        cv2.fillPoly(
+            road_roi,
+            road_polygon,
+            255
+        )
+
+        white_lane = cv2.bitwise_and(
             white_mask,
+            road_roi
+        )
+
+        yellow_center = cv2.bitwise_and(
+            yellow_mask,
+            road_roi
+        )
+
+        # morphology
+        kernel = np.ones(
+            (3, 3),
+            np.uint8
+        )
+
+        white_lane = cv2.morphologyEx(
+            white_lane,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        white_lane = cv2.morphologyEx(
+            white_lane,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
+
+        yellow_center = cv2.morphologyEx(
+            yellow_center,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        # blur
+        white_lane = cv2.GaussianBlur(
+            white_lane,
             (5, 5),
             0
         )
 
-        yellow_mask = cv2.GaussianBlur(
-            yellow_mask,
+        yellow_center = cv2.GaussianBlur(
+            yellow_center,
             (5, 5),
             0
         )
 
-        # =====================================
-        # Canny
-        # =====================================
-        white_edges = cv2.Canny(
-            white_mask,
-            50,
-            150
+        _, white_lane = cv2.threshold(
+            white_lane,
+            127,
+            255,
+            cv2.THRESH_BINARY
         )
 
-        yellow_edges = cv2.Canny(
+        _, yellow_center = cv2.threshold(
+            yellow_center,
+            127,
+            255,
+            cv2.THRESH_BINARY
+        )
+
+        return white_lane, yellow_center
+
+    # =========================================
+    # yellow dotted centerline
+    # =========================================
+    def detect_yellow_centerline(self, yellow_mask):
+
+        height = yellow_mask.shape[0]
+        width = yellow_mask.shape[1]
+        lookahead_y = int(height * 0.42)
+
+        center_roi = np.zeros_like(
+            yellow_mask
+        )
+
+        center_polygon = np.array([[
+            (int(width * 0.02), height),
+            (int(width * 0.76), height),
+            (int(width * 0.66), int(height * 0.12)),
+            (int(width * 0.08), int(height * 0.12))
+        ]], np.int32)
+
+        cv2.fillPoly(
+            center_roi,
+            center_polygon,
+            255
+        )
+
+        yellow_roi = cv2.bitwise_and(
             yellow_mask,
-            50,
-            150
+            center_roi
         )
 
-        # =====================================
-        # Hough
-        # =====================================
-        white_lines = cv2.HoughLinesP(
-            white_edges,
-            1,
-            np.pi / 180,
-            30,
-            minLineLength=30,
-            maxLineGap=40
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            yellow_roi,
+            8
         )
 
-        yellow_lines = cv2.HoughLinesP(
-            yellow_edges,
-            1,
-            np.pi / 180,
-            15,
-            minLineLength=15,
-            maxLineGap=60
+        valid_mask = np.zeros_like(
+            yellow_roi
         )
 
-        # =====================================
-        # 차선 없으면 이전값 유지
-        # =====================================
-        if white_lines is None or yellow_lines is None:
+        for label in range(1, num_labels):
 
-            return self.prev_angle
+            area = stats[label, cv2.CC_STAT_AREA]
+            dash_width = stats[label, cv2.CC_STAT_WIDTH]
+            dash_height = stats[label, cv2.CC_STAT_HEIGHT]
 
-        # =====================================
-        # 실제 차선 위치 찾기
-        # 화면 하단 기준
-        # =====================================
-        left_positions = []
-        right_positions = []
+            if area >= 16 and dash_width >= 3 and dash_height >= 5:
 
-        # =====================================
-        # 흰 실선
-        # 왼쪽 차선
-        # =====================================
-        for line in white_lines:
+                valid_mask[labels == label] = 255
 
-            x1, y1, x2, y2 = line[0]
+        nonzero = valid_mask.nonzero()
 
-            slope = 999
+        if len(nonzero[0]) < 25:
 
-            if x2 != x1:
-                slope = (y2 - y1) / (x2 - x1)
+            self.yellow_miss_count += 1
 
-            if abs(slope) < 0.2:
-                continue
+            if self.yellow_miss_count > 5:
 
-            # 아래쪽 점 사용
-            if y1 > y2:
-                x_bottom = x1
-            else:
-                x_bottom = x2
+                self.yellowx_previous = None
+                self.yellow_lookahead_previous = None
 
-            left_positions.append(x_bottom)
+            return None, yellow_roi
 
-            cv2.line(
-                roi,
-                (x1, y1),
-                (x2, y2),
-                (255, 255, 255),
-                3
+        yellow_y = np.array(nonzero[0])
+        yellow_x = np.array(nonzero[1])
+
+        lower_part = yellow_y > int(height * 0.35)
+
+        if np.count_nonzero(lower_part) >= 15:
+
+            fit_y = yellow_y[lower_part]
+            fit_x = yellow_x[lower_part]
+
+        else:
+
+            fit_y = yellow_y
+            fit_x = yellow_x
+
+        try:
+
+            degree = 2 if len(yellow_x) >= 80 else 1
+
+            fit = np.polyfit(
+                yellow_y,
+                yellow_x,
+                degree
             )
 
-        # =====================================
-        # 노란 점선
-        # 오른쪽 차선
-        # =====================================
-        for line in yellow_lines:
-
-            x1, y1, x2, y2 = line[0]
-
-            slope = 999
-
-            if x2 != x1:
-                slope = (y2 - y1) / (x2 - x1)
-
-            if abs(slope) < 0.2:
-                continue
-
-            # 아래쪽 점 사용
-            if y1 > y2:
-                x_bottom = x1
-            else:
-                x_bottom = x2
-
-            right_positions.append(x_bottom)
-
-            cv2.line(
-                roi,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 255),
-                3
+            yellow_x_bottom = int(
+                np.polyval(
+                    fit,
+                    height - 1
+                )
             )
 
-        # =====================================
-        # 차선 부족
-        # =====================================
-        if len(left_positions) == 0:
+            yellow_x_lookahead = int(
+                np.polyval(
+                    fit,
+                    lookahead_y
+                )
+            )
 
-            return self.prev_angle
+        except Exception:
 
-        if len(right_positions) == 0:
+            yellow_x_bottom = int(
+                np.median(
+                    fit_x
+                )
+            )
 
-            return self.prev_angle
+            yellow_x_lookahead = yellow_x_bottom
+
+        yellow_x_bottom = int(
+            np.clip(
+                yellow_x_bottom,
+                0,
+                int(width * 0.72)
+            )
+        )
+
+        yellow_x_lookahead = int(
+            np.clip(
+                yellow_x_lookahead,
+                yellow_x_bottom - 145,
+                yellow_x_bottom + 145
+            )
+        )
+
+        yellow_x_lookahead = int(
+            np.clip(
+                yellow_x_lookahead,
+                0,
+                int(width * 0.76)
+            )
+        )
+
+        if self.yellowx_previous is not None:
+
+            yellow_x_bottom = int(
+                0.75 * self.yellowx_previous +
+                0.25 * yellow_x_bottom
+            )
+
+        if self.yellow_lookahead_previous is not None:
+
+            yellow_x_lookahead = int(
+                0.80 * self.yellow_lookahead_previous +
+                0.20 * yellow_x_lookahead
+            )
+
+        self.yellowx_previous = yellow_x_bottom
+        self.yellow_lookahead_previous = yellow_x_lookahead
+
+        self.yellow_miss_count = 0
+
+        yellow_info = {
+            "bottom_x": yellow_x_bottom,
+            "lookahead_x": yellow_x_lookahead,
+            "lookahead_y": lookahead_y
+        }
+
+        return yellow_info, valid_mask
+
+    # =========================================
+    # lane driving
+    # =========================================
+    def lane_driving(self, frame):
 
         # =====================================
-        # 실제 차선 위치
+        # 더 먼 차선까지 보도록 ROI 확대
         # =====================================
-        left_lane = int(np.mean(left_positions))
-        right_lane = int(np.mean(right_positions))
+        roi = frame[
+            150:480,
+            :
+        ]
 
         # =====================================
-        # 1차선 중앙
+        # 흰색 차선과 노란 중앙선을 따로 인식
         # =====================================
-        lane_center = (left_lane + right_lane) // 2
+        white_binary, yellow_binary = self.preprocessing(
+            roi
+        )
 
         # =====================================
-        # 차량 목표 중앙
+        # sliding window
         # =====================================
-        target = roi_w // 2
+        out_img, lane_center, right_lane_x, right_lane_lookahead = (
+            self.slidewindow.slidewindow(
+                white_binary
+            )
+        )
+
+        yellow_info, yellow_debug = self.detect_yellow_centerline(
+            yellow_binary
+        )
 
         # =====================================
-        # 오차
+        # target center
+        # =====================================
+        target = 320
+        centerline_guard_x = target - 85
+        yellow_center_x = None
+        yellow_lookahead_x = None
+
+        # 노란 점선이 끊긴 프레임의 기본값: 최근 차로 폭과 오른쪽
+        # 경계로 차로의 실제 중점을 계산한다.
+        bottom_lane_center = (
+            right_lane_x - self.lane_width_bottom_estimate / 2.0
+        )
+        lookahead_lane_center = (
+            right_lane_lookahead -
+            self.lane_width_lookahead_estimate / 2.0
+        )
+
+        if yellow_info is not None:
+
+            yellow_center_x = yellow_info["bottom_x"]
+            yellow_lookahead_x = yellow_info["lookahead_x"]
+
+            lane_width_bottom = right_lane_x - yellow_center_x
+            lane_width_lookahead = (
+                right_lane_lookahead - yellow_lookahead_x
+            )
+
+            if 170 <= lane_width_bottom <= 430:
+
+                self.lane_width_bottom_estimate = (
+                    0.85 * self.lane_width_bottom_estimate +
+                    0.15 * lane_width_bottom
+                )
+                bottom_lane_center = (
+                    yellow_center_x + right_lane_x
+                ) / 2.0
+
+            else:
+
+                bottom_lane_center = (
+                    yellow_center_x +
+                    self.lane_width_bottom_estimate / 2.0
+                )
+
+            if 130 <= lane_width_lookahead <= 390:
+
+                self.lane_width_lookahead_estimate = (
+                    0.85 * self.lane_width_lookahead_estimate +
+                    0.15 * lane_width_lookahead
+                )
+                lookahead_lane_center = (
+                    yellow_lookahead_x + right_lane_lookahead
+                ) / 2.0
+
+            else:
+
+                lookahead_lane_center = (
+                    yellow_lookahead_x +
+                    self.lane_width_lookahead_estimate / 2.0
+                )
+
+        # 가까운 중점을 주로 사용하고 먼 중점으로 커브를 미리 반영한다.
+        lane_center = int(
+            0.70 * bottom_lane_center +
+            0.30 * lookahead_lane_center
+        )
+
+        # 노란선이 차량 쪽으로 가까워질 때만 추가로 오른쪽에 여유를 둔다.
+        if yellow_center_x is not None:
+
+            centerline_error = max(
+                0,
+                yellow_center_x - centerline_guard_x
+            )
+
+            lane_center += int(centerline_error * 0.8)
+
+        lane_center = int(
+            np.clip(
+                lane_center,
+                0,
+                white_binary.shape[1] - 1
+            )
+        )
+
+        curve_delta = (
+            right_lane_x - right_lane_lookahead
+        )
+
+        curve_feedforward = float(
+            np.clip(
+                curve_delta * 0.22,
+                -22,
+                22
+            )
+        )
+
+        # =====================================
+        # error
         # =====================================
         error = target - lane_center
 
         # =====================================
         # PID
         # =====================================
-        kp = 0.40
-        kd = 0.12
+        kp = 1.08
+
+        kd = 0.32
+
         ki = 0.0005
 
         self.integral += error
+        self.integral = max(min(self.integral, 500), -500)
 
-        derivative = error - self.prev_error
+        derivative = (
+            error - self.prev_error
+        )
 
         angle = (
             kp * error +
             kd * derivative +
-            ki * self.integral
+            ki * self.integral +
+            curve_feedforward
         )
 
         self.prev_error = error
 
         # =====================================
-        # smoothing
+        # smoothing 감소
         # =====================================
-        angle = (
-            0.7 * self.prev_angle +
-            0.3 * angle
-        )
+        if abs(error) > 50:              # 커브: 빠른 반응
+            angle = 0.45 * self.prev_angle + 0.55 * angle
+        else:                            # 직선: 부드럽게
+            angle = 0.70 * self.prev_angle + 0.30 * angle
 
         self.prev_angle = angle
 
         # =====================================
-        # steering 제한
+        # steering limit
         # =====================================
-        angle = max(min(angle, 50), -50)
-
-        # =====================================
-        # 디버그
-        # =====================================
-        cv2.circle(
-            roi,
-            (left_lane, roi_h - 20),
-            8,
-            (255, 255, 255),
-            -1
+        angle = max(
+            min(angle, 90),
+            -90
         )
 
-        cv2.circle(
-            roi,
-            (right_lane, roi_h - 20),
-            8,
-            (0, 255, 255),
-            -1
-        )
+        angle *= -1
 
-        cv2.circle(
-            roi,
-            (lane_center, roi_h - 40),
-            10,
-            (0, 0, 255),
-            -1
-        )
-
+        # =====================================
+        # debug
+        # =====================================
         cv2.line(
-            roi,
+            out_img,
             (target, 0),
-            (target, roi_h),
-            (255, 0, 0),
+            (target, out_img.shape[0]),
+            (0, 255, 0),
             2
         )
 
-        cv2.imshow("white_mask", white_mask)
-        cv2.imshow("yellow_mask", yellow_mask)
-        cv2.imshow("lane_roi", roi)
+        cv2.line(
+            out_img,
+            (centerline_guard_x, 0),
+            (centerline_guard_x, out_img.shape[0]),
+            (0, 165, 255),
+            2
+        )
 
-        print("left_lane :", left_lane)
-        print("right_lane:", right_lane)
+        if yellow_center_x is not None:
+
+            cv2.line(
+                out_img,
+                (yellow_center_x, 0),
+                (yellow_center_x, out_img.shape[0]),
+                (0, 255, 255),
+                2
+            )
+
+            cv2.circle(
+                out_img,
+                (yellow_lookahead_x, yellow_info["lookahead_y"]),
+                8,
+                (0, 255, 255),
+                -1
+            )
+
+            cv2.circle(
+                out_img,
+                (lane_center, out_img.shape[0] - 60),
+                8,
+                (255, 0, 255),
+                -1
+            )
+
+        binary = cv2.bitwise_or(
+            white_binary,
+            yellow_binary
+        )
+
+        cv2.imshow(
+            "binary",
+            binary
+        )
+
+        cv2.imshow(
+            "yellow_centerline",
+            yellow_debug
+        )
+
+        cv2.imshow(
+            "sliding_window",
+            out_img
+        )
+
         print("lane_center:", lane_center)
+        print("target:", target)
         print("error:", error)
         print("angle:", angle)
+        print("yellow_center_x:", yellow_center_x)
+        print("yellow_lookahead_x:", yellow_lookahead_x)
+        print("right_lane_x:", right_lane_x)
+        print("right_lane_lookahead:", right_lane_lookahead)
+        print("curve_feedforward:", curve_feedforward)
 
         return angle
 
     # =========================================
-    # 메인 루프
+    # main loop
     # =========================================
     def main_loop(self):
 
@@ -425,26 +1075,54 @@ class TrackDriverNode(Node):
 
             frame = self.image.copy()
 
-            angle = self.lane_driving(frame)
+            angle = self.lane_driving(
+                frame
+            )
 
-            speed = 4
+            # =================================
+            # speed control
+            # =================================
+            # 조향이 작을수록 직선 속도에 가까워진다. 단계별 if문 대신
+            # 연속 보간과 저역통과 필터를 사용해 속도 급변을 막는다.
+            turn_ratio = float(np.clip(abs(angle) / 45.0, 0.0, 1.0))
+            target_speed = (
+                self.straight_speed -
+                turn_ratio * (self.straight_speed - self.curve_speed)
+            )
+            self.current_speed = (
+                0.92 * self.current_speed +
+                0.08 * target_speed
+            )
+            speed = self.current_speed
 
-            # 커브 감속
-            if abs(angle) > 20:
-                speed = 3
+            if not self.driving_enabled:
+                speed = 0.0
 
-            if abs(angle) > 35:
-                speed = 2
+            # 둘 이상의 노드가 같은 모터 토픽을 발행하면 명령이 서로
+            # 덮어써지므로, 충돌이 해소될 때까지 이 노드는 정지 명령만 보낸다.
+            if self.count_publishers('/xycar_motor') > 1:
+                speed = 0.0
+
+                if not self.publisher_conflict_reported:
+                    self.get_logger().error(
+                        'Multiple /xycar_motor publishers detected; stopping vehicle'
+                    )
+                    self.publisher_conflict_reported = True
+            else:
+                self.publisher_conflict_reported = False
 
             self.drive(angle, speed)
-
-            cv2.imshow("camera", frame)
+            cv2.imshow(
+                "camera",
+                frame
+            )
 
             if cv2.waitKey(1) & 0xFF == 27:
+
                 break
 
     # =========================================
-    # 종료
+    # destroy
     # =========================================
     def destroy(self):
 
