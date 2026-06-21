@@ -873,7 +873,6 @@ class TrackDriverNode(Node):
         # target center
         # =====================================
         target = 320
-        centerline_guard_x = target - 85
         yellow_center_x = None
         yellow_lookahead_x = None
 
@@ -931,31 +930,25 @@ class TrackDriverNode(Node):
                     self.lane_width_lookahead_estimate / 2.0
                 )
 
-        # 가까운 중점을 주로 사용하고 먼 중점으로 커브를 미리 반영한다.
+        # 직선에서는 가까운 중심을 안정적으로 따르고, 코너에서는 먼
+        # 중심의 비중을 최대 50%까지 높여 조향을 더 일찍 시작한다.
+        center_delta = abs(bottom_lane_center - lookahead_lane_center)
+        curve_strength = float(np.clip(center_delta / 80.0, 0.0, 1.0))
+        lookahead_weight = 0.30 + 0.20 * curve_strength
+        bottom_weight = 1.0 - lookahead_weight
         lane_center = int(
-            0.70 * bottom_lane_center +
-            0.30 * lookahead_lane_center
+            bottom_weight * bottom_lane_center +
+            lookahead_weight * lookahead_lane_center
         )
 
         # 가까운 중심과 전방 중심이 나란한 직선에서만 목표를 오른쪽
         # 흰선 방향으로 옮긴다. 커브에서는 보정량을 연속적으로 줄인다.
-        center_delta = abs(bottom_lane_center - lookahead_lane_center)
         straight_ratio = float(np.clip(
             1.0 - center_delta / 60.0,
             0.0,
             1.0
         ))
         lane_center += int(self.straight_right_bias * straight_ratio)
-
-        # 노란선이 차량 쪽으로 가까워질 때만 추가로 오른쪽에 여유를 둔다.
-        if yellow_center_x is not None:
-
-            centerline_error = max(
-                0,
-                yellow_center_x - centerline_guard_x
-            )
-
-            lane_center += int(centerline_error * 0.8)
 
         lane_center = int(
             np.clip(
@@ -971,9 +964,9 @@ class TrackDriverNode(Node):
 
         curve_feedforward = float(
             np.clip(
-                curve_delta * 0.22,
-                -22,
-                22
+                curve_delta * 0.32,
+                -30,
+                30
             )
         )
 
@@ -1054,14 +1047,6 @@ class TrackDriverNode(Node):
             (target, 0),
             (target, out_img.shape[0]),
             (0, 255, 0),
-            2
-        )
-
-        cv2.line(
-            out_img,
-            (centerline_guard_x, 0),
-            (centerline_guard_x, out_img.shape[0]),
-            (0, 165, 255),
             2
         )
 
