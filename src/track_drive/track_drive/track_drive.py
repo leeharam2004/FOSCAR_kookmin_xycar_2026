@@ -1,16 +1,18 @@
+# -1,521 +1,521 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+#아오 커밋어떻게해
+#아직도 안
 # =============================================
 # ROS2 Xycar Lane Driving
 #
 # 개선 내용
-# 1. 직선 구간 좌우 비틀거림 감소
-# 2. S자 구간 차선 추적 강화
+# 1. 더 먼 차선 탐지
+# 2. 커브 조기 인식
 # 3. 오른쪽 실선 기반 2차선 유지
-# 4. 중앙 노란 점선 무시 강화
-# 5. 차선 신뢰도 낮을 때 감속
-# 6. 조향 변화량 제한으로 흔들림 감소
+# 4. 노란 점선 중앙선 별도 인식
+# 5. 조향 반응 강화
+# 6. 커브길 곡선 2번째 까진 안정적 통과후 직진후 차선이탈 문제
 # =============================================
 
 import rclpy
@@ -32,15 +34,8 @@ class SlideWindow:
     def __init__(self):
 
         self.x_previous = 320
-        self.rightx_previous = 520
-
-        # 오른쪽 실선에서 차량 중심까지 거리
-        # 중앙선 쪽으로 붙으면 240~250
-        # 오른쪽 실선 쪽으로 붙으면 270~290
-        self.lane_width_offset = 260
-
-        self.fit_previous = None
-        self.lost_count = 0
+        self.rightx_previous = 580
+        self.rightx_lookahead_previous = 500
 
     def slidewindow(self, img):
 
@@ -50,58 +45,134 @@ class SlideWindow:
         width = img.shape[1]
 
         nonzero = img.nonzero()
-        nonzeroy = np.array(nonzero[0])
-        nonzerox = np.array(nonzero[1])
 
-        # 차선 픽셀이 거의 없으면 이전 위치 유지
-        if len(nonzerox) < 80:
-            self.lost_count += 1
-            return out_img, self.x_previous, 0.0, 0
+        nonzeroy = np.array(nonzero[0])
+
+        nonzerox = np.array(nonzero[1])
 
         # =====================================
         # 오른쪽 차선 시작점 탐색
-        # 중앙 점선을 피하기 위해 오른쪽 영역 위주로 탐색
+        # 중앙선 오인식을 막기 위해 아래쪽 오른쪽 영역만 사용
         # =====================================
-        x_start = int(width * 0.50)
-        x_end = int(width * 0.98)
-
-        y_start = int(height * 0.55)
+        right_search_x = int(width * 0.52)
 
         right_region = img[
-            y_start:height,
-            x_start:x_end
+            int(height * 0.55):height,
+            right_search_x:width
         ]
 
-        histogram = np.sum(right_region, axis=0)
+        histogram = np.sum(
+            right_region,
+            axis=0
+        )
 
-        if np.max(histogram) < 1200:
-            rightx_current = self.rightx_previous
+        if len(histogram) == 0 or np.max(histogram) < 255 * 20:
+
+            rightx_current = int(
+                np.clip(
+                    self.rightx_previous,
+                    right_search_x,
+                    width - 1
+                )
+            )
+
         else:
-            rightx_current = np.argmax(histogram) + x_start
+
+            smooth_histogram = np.convolve(
+                histogram,
+                np.ones(9),
+                mode='same'
+            )
+
+            peak_value = np.max(
+                smooth_histogram
+            )
+
+            candidate_x = (
+                np.where(
+                    smooth_histogram > peak_value * 0.35
+                )[0] + right_search_x
+            )
+
+            if len(candidate_x) == 0:
+
+                rightx_current = (
+                    np.argmax(smooth_histogram)
+                    + right_search_x
+                )
+
+            else:
+
+                rightx_current = int(
+                    candidate_x[
+                        np.argmin(
+                            np.abs(candidate_x - self.rightx_previous)
+                        )
+                    ]
+                )
+
+            if abs(rightx_current - self.rightx_previous) > 160:
+
+                rightx_current = int(
+                    0.65 * self.rightx_previous +
+                    0.35 * rightx_current
+                )
+
+            rightx_current = int(
+                np.clip(
+                    rightx_current,
+                    right_search_x,
+                    int(width * 0.93)
+                )
+            )
 
         # =====================================
-        # Sliding Window
-        # S자 대응을 위해 window 개수와 margin 증가
+        # sliding window parameter
         # =====================================
-        nwindows = 14
-        window_height = int(height / nwindows)
+        nwindows = 12
 
-        margin = 90
-        minpix = 15
+        window_height = int(
+            height / nwindows
+        )
+
+        margin = 55
+
+        minpix = 25
 
         right_lane_inds = []
 
+        # =====================================
+        # sliding windows
+        # =====================================
         for window in range(nwindows):
 
-            win_y_low = height - (window + 1) * window_height
-            win_y_high = height - window * window_height
+            win_y_low = (
+                height - (window + 1) * window_height
+            )
 
-            win_x_low = rightx_current - margin
-            win_x_high = rightx_current + margin
+            win_y_high = (
+                height - window * window_height
+            )
 
-            win_x_low = max(0, win_x_low)
-            win_x_high = min(width, win_x_high)
+            # 아래쪽 윈도우는 반드시 오른쪽 차선 영역에서만 찾는다.
+            # 위쪽은 커브를 따라갈 수 있도록 조금 더 열어둔다.
+            if win_y_low > int(height * 0.45):
 
+                min_lane_x = int(width * 0.50)
+
+            else:
+
+                min_lane_x = int(width * 0.30)
+
+            win_x_low = max(
+                rightx_current - margin, min_lane_x
+            )
+
+            win_x_high = min(
+                rightx_current + margin, width - 1
+            )
+
+            # draw window
             cv2.rectangle(
                 out_img,
                 (win_x_low, win_y_low),
@@ -110,6 +181,7 @@ class SlideWindow:
                 2
             )
 
+            # lane pixels
             good_inds = (
                 (
                     (nonzeroy >= win_y_low) &
@@ -119,182 +191,158 @@ class SlideWindow:
                 ).nonzero()[0]
             )
 
-            right_lane_inds.append(good_inds)
+            right_lane_inds.append(
+                good_inds
+            )
 
+            # 다음 윈도우 위치 이동
             if len(good_inds) > minpix:
 
-                mean_x = int(np.mean(nonzerox[good_inds]))
+                rightx_current = int(
+                    np.mean(
+                        nonzerox[good_inds]
+                    )
+                )
 
-                # 중앙 점선 쪽으로 튀는 것 방지
-                if mean_x > int(width * 0.45):
-                    rightx_current = mean_x
+        # concatenate
+        if len(right_lane_inds) > 0:
 
-        right_lane_inds = np.concatenate(right_lane_inds)
+            right_lane_inds = np.concatenate(
+                right_lane_inds
+            )
 
-        if len(right_lane_inds) < 70:
-            self.lost_count += 1
-            return out_img, self.x_previous, 0.2, 0
+        # =====================================
+        # 차선 못 찾으면 이전값 유지
+        # =====================================
+        if len(right_lane_inds) == 0:
 
+            return (
+                out_img,
+                self.x_previous,
+                self.rightx_previous,
+                self.rightx_lookahead_previous
+            )
+
+        # =====================================
+        # 중앙선/잡음으로 점프하는 경우 방지
+        # =====================================
         lane_x = nonzerox[right_lane_inds]
         lane_y = nonzeroy[right_lane_inds]
 
-        # 너무 왼쪽 픽셀 제거
-        valid = lane_x > int(width * 0.43)
+        lower_lane = lane_y > int(height * 0.55)
 
-        lane_x = lane_x[valid]
-        lane_y = lane_y[valid]
+        if np.count_nonzero(lower_lane) < minpix:
 
-        if len(lane_x) < 70:
-            self.lost_count += 1
-            return out_img, self.x_previous, 0.2, 0
-
-        # =====================================
-        # 차선 곡선 피팅
-        # =====================================
-        try:
-            fit = np.polyfit(lane_y, lane_x, 2)
-        except:
-            self.lost_count += 1
-            return out_img, self.x_previous, 0.2, 0
-
-        # 이전 fit과 섞어서 직선 구간 흔들림 감소
-        if self.fit_previous is not None:
-            fit = 0.35 * self.fit_previous + 0.65 * fit
-
-        self.fit_previous = fit
-
-        # =====================================
-        # 가까운 점 / 중간 점 / 먼 점 사용
-        # 직선에서는 가까운 점 중심
-        # S자에서는 중간/먼 점도 반영
-        # =====================================
-        near_y = int(height * 0.90)
-        mid_y = int(height * 0.65)
-        far_y = int(height * 0.42)
-
-        rightx_near = int(
-            fit[0] * near_y ** 2 +
-            fit[1] * near_y +
-            fit[2]
-        )
-
-        rightx_mid = int(
-            fit[0] * mid_y ** 2 +
-            fit[1] * mid_y +
-            fit[2]
-        )
-
-        rightx_far = int(
-            fit[0] * far_y ** 2 +
-            fit[1] * far_y +
-            fit[2]
-        )
-
-        rightx_near = int(np.clip(rightx_near, 0, width - 1))
-        rightx_mid = int(np.clip(rightx_mid, 0, width - 1))
-        rightx_far = int(np.clip(rightx_far, 0, width - 1))
-
-        # curve 값이 클수록 S자/커브로 판단
-        curve = rightx_far - rightx_near
-
-        # 직선 구간
-        if abs(curve) < 35:
-
-            rightx = int(
-                0.75 * rightx_near +
-                0.25 * rightx_mid
+            return (
+                out_img,
+                self.x_previous,
+                self.rightx_previous,
+                self.rightx_lookahead_previous
             )
 
-            center_alpha = 0.30
-            max_jump = 45
+        lower_median_x = np.median(
+            lane_x[lower_lane]
+        )
 
-        # 곡선/S자 구간
+        if lower_median_x < int(width * 0.55):
+
+            return (
+                out_img,
+                self.x_previous,
+                self.rightx_previous,
+                self.rightx_lookahead_previous
+            )
+
+        lookahead_y = int(height * 0.42)
+
+        if len(lane_x) >= 50:
+
+            fit = np.polyfit(
+                lane_y,
+                lane_x,
+                2
+            )
+
+            rightx = int(
+                np.polyval(
+                    fit,
+                    height - 1
+                )
+            )
+
+            rightx_lookahead = int(
+                np.polyval(
+                    fit,
+                    lookahead_y
+                )
+            )
+
         else:
 
-            rightx = int(
-                0.40 * rightx_near +
-                0.40 * rightx_mid +
-                0.20 * rightx_far
+            rightx = int(lower_median_x)
+            rightx_lookahead = rightx
+
+        rightx = int(
+            np.clip(
+                rightx,
+                int(width * 0.55),
+                width - 1
             )
+        )
 
-            center_alpha = 0.65
-            max_jump = 95
-
-        rightx = int(np.clip(
-            rightx,
-            int(width * 0.42),
-            width - 5
-        ))
-
-        self.rightx_previous = rightx
+        rightx_lookahead = int(
+            np.clip(
+                rightx_lookahead,
+                int(width * 0.30),
+                width - 1
+            )
+        )
 
         # =====================================
-        # 오른쪽 실선 기준 2차선 중심 계산
+        # 2차선 중심 계산
         # =====================================
-        x_location = rightx - self.lane_width_offset
+        lane_width_offset_bottom = 260
+        lane_width_offset_lookahead = 215
 
-        x_location = int(np.clip(
-            x_location,
-            0,
-            width - 1
-        ))
+        bottom_center = (
+            rightx - lane_width_offset_bottom
+        )
 
-        # =====================================
-        # 중심값 급격한 변화 제한
-        # 직선 좌우 비틀거림 방지 핵심
-        # =====================================
-        diff = x_location - self.x_previous
-
-        if abs(diff) > max_jump:
-            x_location = self.x_previous + np.sign(diff) * max_jump
-            x_location = int(x_location)
+        lookahead_center = (
+            rightx_lookahead - lane_width_offset_lookahead
+        )
 
         x_location = int(
-            (1.0 - center_alpha) * self.x_previous +
-            center_alpha * x_location
+            0.65 * bottom_center +
+            0.35 * lookahead_center
         )
+
+        if abs(x_location - self.x_previous) > 110:
+
+            x_location = int(
+                0.65 * self.x_previous +
+                0.35 * x_location
+            )
+
+        self.rightx_previous = rightx
+        self.rightx_lookahead_previous = rightx_lookahead
 
         self.x_previous = x_location
-        self.lost_count = 0
-
-        # 차선 신뢰도
-        confidence = min(1.0, len(lane_x) / 500.0)
 
         # =====================================
-        # Debug Drawing
+        # debug
         # =====================================
-        ploty = np.linspace(0, height - 1, height)
-
-        fitx = (
-            fit[0] * ploty ** 2 +
-            fit[1] * ploty +
-            fit[2]
-        )
-
-        pts = np.array(
-            [np.transpose(np.vstack([fitx, ploty]))],
-            dtype=np.int32
-        )
-
-        cv2.polylines(
-            out_img,
-            pts,
-            False,
-            (255, 255, 0),
-            4
-        )
-
         cv2.circle(
             out_img,
-            (rightx_near, near_y),
-            8,
+            (rightx, height - 20),
+            10,
             (0, 255, 255),
             -1
         )
 
         cv2.circle(
             out_img,
-            (rightx_mid, mid_y),
+            (rightx_lookahead, lookahead_y),
             8,
             (255, 255, 0),
             -1
@@ -302,21 +350,13 @@ class SlideWindow:
 
         cv2.circle(
             out_img,
-            (rightx_far, far_y),
-            8,
-            (255, 0, 255),
-            -1
-        )
-
-        cv2.circle(
-            out_img,
-            (x_location, mid_y),
+            (x_location, height - 40),
             10,
             (0, 0, 255),
             -1
         )
 
-        return out_img, x_location, confidence, curve
+        return out_img, x_location, rightx, rightx_lookahead
 
 
 # =============================================
@@ -336,18 +376,25 @@ class TrackDriverNode(Node):
 
         self.motor_msg = XycarMotor()
 
-        # PID 관련 변수
+        # PID
         self.prev_error = 0
+
         self.integral = 0
+
         self.prev_angle = 0
 
-        # 직선 흔들림 방지 필터
-        self.filtered_error = 0
-        self.filtered_derivative = 0
+        # 직선에서는 속도를 높이고 커브에서는 낮춘다. 속도는 아래
+        # main_loop에서 연속적으로 보간해 급격한 단계 변화를 방지한다.
+        self.straight_speed = 2.0
+        self.curve_speed = 1.0
+        self.current_speed = self.curve_speed
+        self.max_speed_command = self.straight_speed
+        self.publisher_conflict_reported = False
 
-        # 차선 상태 저장
-        self.last_confidence = 1.0
-        self.last_curve = 0
+        self.yellowx_previous = None
+        self.yellow_lookahead_previous = None
+
+        self.yellow_miss_count = 0
 
         # publisher
         self.motor_pub = self.create_publisher(
@@ -365,11 +412,11 @@ class TrackDriverNode(Node):
         )
 
         self.get_logger().info(
-            "===== Stabilized Lane Driving Start ====="
+            "===== Enhanced Lane Driving Start ====="
         )
 
     # =========================================
-    # camera callback
+    # callback
     # =========================================
     def cam_callback(self, data):
 
@@ -379,12 +426,18 @@ class TrackDriverNode(Node):
         )
 
     # =========================================
-    # motor publish
+    # drive
     # =========================================
     def drive(self, angle, speed):
 
         self.motor_msg.angle = float(angle)
-        self.motor_msg.speed = float(speed)
+
+        # 이후 속도 로직이 변경되더라도 직선 최고 속도를 넘지 않는다.
+        self.motor_msg.speed = float(np.clip(
+            speed,
+            -self.max_speed_command,
+            self.max_speed_command
+        ))
 
         self.motor_pub.publish(
             self.motor_msg
@@ -400,19 +453,15 @@ class TrackDriverNode(Node):
             cv2.COLOR_BGR2HSV
         )
 
-        height = frame.shape[0]
-        width = frame.shape[1]
-
         # =====================================
-        # 흰색 실선
-        # 직선에서 끊기지 않도록 V값을 조금 낮춤
+        # white lane
         # =====================================
         lower_white = np.array([
-            0, 0, 135
+            0, 0, 150
         ])
 
         upper_white = np.array([
-            180, 95, 255
+            180, 80, 255
         ])
 
         white_mask = cv2.inRange(
@@ -422,11 +471,10 @@ class TrackDriverNode(Node):
         )
 
         # =====================================
-        # 노란색 실선
-        # 단, 중앙 노란 점선은 최대한 제거
+        # yellow lane
         # =====================================
         lower_yellow = np.array([
-            15, 70, 70
+            10, 80, 80
         ])
 
         upper_yellow = np.array([
@@ -439,58 +487,251 @@ class TrackDriverNode(Node):
             upper_yellow
         )
 
-        # 중앙 노란 점선 제거
-        yellow_mask[:, :int(width * 0.55)] = 0
+        height = white_mask.shape[0]
+        width = white_mask.shape[1]
 
-        # 흰색 + 오른쪽 노란색만 사용
-        mask = cv2.bitwise_or(
+        road_roi = np.zeros_like(
+            white_mask
+        )
+
+        road_polygon = np.array([[
+            (int(width * 0.02), height),
+            (int(width * 0.98), height),
+            (int(width * 0.82), int(height * 0.10)),
+            (int(width * 0.18), int(height * 0.10))
+        ]], np.int32)
+
+        cv2.fillPoly(
+            road_roi,
+            road_polygon,
+            255
+        )
+
+        white_lane = cv2.bitwise_and(
             white_mask,
-            yellow_mask
+            road_roi
         )
 
-        # 화면 왼쪽 노이즈 제거
-        mask[:, :int(width * 0.35)] = 0
-
-        # =====================================
-        # Morphology
-        # S자에서 차선이 끊겨도 조금 이어주기
-        # =====================================
-        kernel_close = np.ones(
-            (5, 5),
-            np.uint8
+        yellow_center = cv2.bitwise_and(
+            yellow_mask,
+            road_roi
         )
 
-        kernel_open = np.ones(
+        # morphology
+        kernel = np.ones(
             (3, 3),
             np.uint8
         )
 
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_CLOSE,
-            kernel_close
-        )
-
-        mask = cv2.morphologyEx(
-            mask,
+        white_lane = cv2.morphologyEx(
+            white_lane,
             cv2.MORPH_OPEN,
-            kernel_open
+            kernel
         )
 
-        mask = cv2.GaussianBlur(
-            mask,
+        white_lane = cv2.morphologyEx(
+            white_lane,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
+
+        yellow_center = cv2.morphologyEx(
+            yellow_center,
+            cv2.MORPH_OPEN,
+            kernel
+        )
+
+        # blur
+        white_lane = cv2.GaussianBlur(
+            white_lane,
             (5, 5),
             0
         )
 
-        _, mask = cv2.threshold(
-            mask,
-            120,
+        yellow_center = cv2.GaussianBlur(
+            yellow_center,
+            (5, 5),
+            0
+        )
+
+        _, white_lane = cv2.threshold(
+            white_lane,
+            127,
             255,
             cv2.THRESH_BINARY
         )
 
-        return mask
+        _, yellow_center = cv2.threshold(
+            yellow_center,
+            127,
+            255,
+            cv2.THRESH_BINARY
+        )
+
+        return white_lane, yellow_center
+
+    # =========================================
+    # yellow dotted centerline
+    # =========================================
+    def detect_yellow_centerline(self, yellow_mask):
+
+        height = yellow_mask.shape[0]
+        width = yellow_mask.shape[1]
+        lookahead_y = int(height * 0.42)
+
+        center_roi = np.zeros_like(
+            yellow_mask
+        )
+
+        center_polygon = np.array([[
+            (int(width * 0.02), height),
+            (int(width * 0.76), height),
+            (int(width * 0.66), int(height * 0.12)),
+            (int(width * 0.08), int(height * 0.12))
+        ]], np.int32)
+
+        cv2.fillPoly(
+            center_roi,
+            center_polygon,
+            255
+        )
+
+        yellow_roi = cv2.bitwise_and(
+            yellow_mask,
+            center_roi
+        )
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            yellow_roi,
+            8
+        )
+
+        valid_mask = np.zeros_like(
+            yellow_roi
+        )
+
+        for label in range(1, num_labels):
+
+            area = stats[label, cv2.CC_STAT_AREA]
+            dash_width = stats[label, cv2.CC_STAT_WIDTH]
+            dash_height = stats[label, cv2.CC_STAT_HEIGHT]
+
+            if area >= 16 and dash_width >= 3 and dash_height >= 5:
+
+                valid_mask[labels == label] = 255
+
+        nonzero = valid_mask.nonzero()
+
+        if len(nonzero[0]) < 25:
+
+            self.yellow_miss_count += 1
+
+            if self.yellow_miss_count > 5:
+
+                self.yellowx_previous = None
+                self.yellow_lookahead_previous = None
+
+            return None, yellow_roi
+
+        yellow_y = np.array(nonzero[0])
+        yellow_x = np.array(nonzero[1])
+
+        lower_part = yellow_y > int(height * 0.35)
+
+        if np.count_nonzero(lower_part) >= 15:
+
+            fit_y = yellow_y[lower_part]
+            fit_x = yellow_x[lower_part]
+
+        else:
+
+            fit_y = yellow_y
+            fit_x = yellow_x
+
+        try:
+
+            degree = 2 if len(yellow_x) >= 80 else 1
+
+            fit = np.polyfit(
+                yellow_y,
+                yellow_x,
+                degree
+            )
+
+            yellow_x_bottom = int(
+                np.polyval(
+                    fit,
+                    height - 1
+                )
+            )
+
+            yellow_x_lookahead = int(
+                np.polyval(
+                    fit,
+                    lookahead_y
+                )
+            )
+
+        except Exception:
+
+            yellow_x_bottom = int(
+                np.median(
+                    fit_x
+                )
+            )
+
+            yellow_x_lookahead = yellow_x_bottom
+
+        yellow_x_bottom = int(
+            np.clip(
+                yellow_x_bottom,
+                0,
+                int(width * 0.72)
+            )
+        )
+
+        yellow_x_lookahead = int(
+            np.clip(
+                yellow_x_lookahead,
+                yellow_x_bottom - 145,
+                yellow_x_bottom + 145
+            )
+        )
+
+        yellow_x_lookahead = int(
+            np.clip(
+                yellow_x_lookahead,
+                0,
+                int(width * 0.76)
+            )
+        )
+
+        if self.yellowx_previous is not None:
+
+            yellow_x_bottom = int(
+                0.75 * self.yellowx_previous +
+                0.25 * yellow_x_bottom
+            )
+
+        if self.yellow_lookahead_previous is not None:
+
+            yellow_x_lookahead = int(
+                0.80 * self.yellow_lookahead_previous +
+                0.20 * yellow_x_lookahead
+            )
+
+        self.yellowx_previous = yellow_x_bottom
+        self.yellow_lookahead_previous = yellow_x_lookahead
+
+        self.yellow_miss_count = 0
+
+        yellow_info = {
+            "bottom_x": yellow_x_bottom,
+            "lookahead_x": yellow_x_lookahead,
+            "lookahead_y": lookahead_y
+        }
+
+        return yellow_info, valid_mask
 
     # =========================================
     # lane driving
@@ -498,121 +739,191 @@ class TrackDriverNode(Node):
     def lane_driving(self, frame):
 
         # =====================================
-        # ROI
-        # 너무 위쪽까지 보면 노이즈가 많아져서 흔들릴 수 있음
+        # 더 먼 차선까지 보도록 ROI 확대
         # =====================================
         roi = frame[
-            130:480,
+            150:480,
             :
         ]
 
-        binary = self.preprocessing(
+        # =====================================
+        # 흰색 차선과 노란 중앙선을 따로 인식
+        # =====================================
+        white_binary, yellow_binary = self.preprocessing(
             roi
         )
 
-        out_img, lane_center, confidence, curve = (
+        # =====================================
+        # sliding window
+        # =====================================
+        out_img, lane_center, right_lane_x, right_lane_lookahead = (
             self.slidewindow.slidewindow(
-                binary
+                white_binary
             )
         )
 
-        self.last_confidence = confidence
-        self.last_curve = curve
+        yellow_info, yellow_debug = self.detect_yellow_centerline(
+            yellow_binary
+        )
 
+        # =====================================
+        # target center
+        # =====================================
         target = 320
 
+        # =====================================
+        # 중앙선 침범 방지 + 실제 차로 중앙 보정
+        # =====================================
+        centerline_guard_x = target - 85
+        yellow_center_x = None
+        yellow_lookahead_x = None
+
+        if yellow_info is not None:
+
+            yellow_center_x = yellow_info["bottom_x"]
+            yellow_lookahead_x = yellow_info["lookahead_x"]
+
+            lane_width_bottom = (
+                right_lane_x - yellow_center_x
+            )
+
+            if 170 <= lane_width_bottom <= 430:
+
+                boundary_center = int(
+                    (
+                        right_lane_x +
+                        yellow_center_x
+                    ) / 2
+                )
+
+                lane_center = int(
+                    0.55 * lane_center +
+                    0.45 * boundary_center
+                )
+
+            else:
+
+                yellow_based_center = int(
+                    yellow_center_x + 155
+                )
+
+                lane_center = int(
+                    0.70 * lane_center +
+                    0.30 * yellow_based_center
+                )
+
+            lane_width_lookahead = (
+                right_lane_lookahead - yellow_lookahead_x
+            )
+
+            if 130 <= lane_width_lookahead <= 390:
+
+                boundary_center_lookahead = int(
+                    (
+                        right_lane_lookahead +
+                        yellow_lookahead_x
+                    ) / 2
+                )
+
+                lane_center = int(
+                    0.82 * lane_center +
+                    0.18 * boundary_center_lookahead
+                )
+
+            min_center_from_yellow = (
+                yellow_center_x + 145
+            )
+
+            if lane_center < min_center_from_yellow:
+
+                lane_center = min_center_from_yellow
+
+            centerline_error = max(
+                0,
+                yellow_center_x - centerline_guard_x
+            )
+
+            if centerline_error > 0:
+
+                lane_center = int(
+                    min(
+                        white_binary.shape[1] - 1,
+                        lane_center + centerline_error * 1.1
+                    )
+                )
+
+        lane_center = int(
+            np.clip(
+                lane_center,
+                0,
+                white_binary.shape[1] - 1
+            )
+        )
+
+        curve_delta = (
+            right_lane_x - right_lane_lookahead
+        )
+
+        curve_feedforward = float(
+            np.clip(
+                curve_delta * 0.22,
+                -22,
+                22
+            )
+        )
+
+        # =====================================
+        # error
+        # =====================================
         error = target - lane_center
 
         # =====================================
-        # 직선 비틀거림 방지
-        # 작은 오차는 무시
-        # =====================================
-        if abs(error) < 10:
-            error = 0
-
-        # error 필터링
-        self.filtered_error = (
-            0.70 * self.filtered_error +
-            0.30 * error
-        )
-
-        derivative = self.filtered_error - self.prev_error
-
-        self.filtered_derivative = (
-            0.75 * self.filtered_derivative +
-            0.25 * derivative
-        )
-
-        self.prev_error = self.filtered_error
-
-        # =====================================
         # PID
-        # 기존보다 약하게 조정해서 직선 흔들림 감소
         # =====================================
-        kp = 0.60
-        kd = 0.15
-        ki = 0.0
+        kp = 1.08
 
-        # S자 / 커브에서는 반응을 조금 키움
-        if abs(curve) > 55:
-            kp = 0.95
-            kd = 0.28
+        kd = 0.32
 
-        self.integral += self.filtered_error
+        ki = 0.0005
 
-        self.integral = max(
-            min(self.integral, 5000),
-            -5000
+        self.integral += error
+        self.integral = max(min(self.integral, 500), -500)
+
+        derivative = (
+            error - self.prev_error
         )
 
         angle = (
-            kp * self.filtered_error +
-            kd * self.filtered_derivative +
-            ki * self.integral
+            kp * error +
+            kd * derivative +
+            ki * self.integral +
+            curve_feedforward
         )
 
-        # =====================================
-        # 차선 신뢰도가 낮을 때
-        # 새 조향값을 강하게 믿지 않고 이전 조향 유지
-        # =====================================
-        if confidence < 0.25:
-            angle = self.prev_angle * 0.85
+        self.prev_error = error
 
         # =====================================
-        # 조향 방향
-        # 만약 차가 반대로 꺾이면 이 값만 -1.0으로 바꾸면 됨
+        # smoothing 감소
         # =====================================
-        STEER_SIGN = 1.0
-
-        angle = STEER_SIGN * angle
-
-        # =====================================
-        # 조향 변화량 제한
-        # 직선 비틀거림 방지 핵심
-        # =====================================
-        max_angle_change = 8
-
-        if abs(curve) > 55:
-            max_angle_change = 14
-
-        angle_diff = angle - self.prev_angle
-
-        if angle_diff > max_angle_change:
-            angle = self.prev_angle + max_angle_change
-
-        elif angle_diff < -max_angle_change:
-            angle = self.prev_angle - max_angle_change
-
-        # 최종 조향 제한
-        angle = max(
-            min(angle, 70),
-            -70
-        )
+        if abs(error) > 50:              # 커브: 빠른 반응
+            angle = 0.45 * self.prev_angle + 0.55 * angle
+        else:                            # 직선: 부드럽게
+            angle = 0.70 * self.prev_angle + 0.30 * angle
 
         self.prev_angle = angle
 
         # =====================================
-        # Debug
+        # steering limit
+        # =====================================
+        angle = max(
+            min(angle, 90),
+            -90
+        )
+
+        angle *= -1
+
+        # =====================================
+        # debug
         # =====================================
         cv2.line(
             out_img,
@@ -622,17 +933,53 @@ class TrackDriverNode(Node):
             2
         )
 
-        cv2.circle(
+        cv2.line(
             out_img,
-            (lane_center, int(out_img.shape[0] * 0.65)),
-            8,
-            (0, 0, 255),
-            -1
+            (centerline_guard_x, 0),
+            (centerline_guard_x, out_img.shape[0]),
+            (0, 165, 255),
+            2
+        )
+
+        if yellow_center_x is not None:
+
+            cv2.line(
+                out_img,
+                (yellow_center_x, 0),
+                (yellow_center_x, out_img.shape[0]),
+                (0, 255, 255),
+                2
+            )
+
+            cv2.circle(
+                out_img,
+                (yellow_lookahead_x, yellow_info["lookahead_y"]),
+                8,
+                (0, 255, 255),
+                -1
+            )
+
+            cv2.circle(
+                out_img,
+                (lane_center, out_img.shape[0] - 60),
+                8,
+                (255, 0, 255),
+                -1
+            )
+
+        binary = cv2.bitwise_or(
+            white_binary,
+            yellow_binary
         )
 
         cv2.imshow(
             "binary",
             binary
+        )
+
+        cv2.imshow(
+            "yellow_centerline",
+            yellow_debug
         )
 
         cv2.imshow(
@@ -643,10 +990,12 @@ class TrackDriverNode(Node):
         print("lane_center:", lane_center)
         print("target:", target)
         print("error:", error)
-        print("filtered_error:", self.filtered_error)
-        print("curve:", curve)
-        print("confidence:", confidence)
         print("angle:", angle)
+        print("yellow_center_x:", yellow_center_x)
+        print("yellow_lookahead_x:", yellow_lookahead_x)
+        print("right_lane_x:", right_lane_x)
+        print("right_lane_lookahead:", right_lane_lookahead)
+        print("curve_feedforward:", curve_feedforward)
 
         return angle
 
@@ -674,34 +1023,40 @@ class TrackDriverNode(Node):
             # =================================
             # speed control
             # =================================
-            speed = 5
-
-            # 차선 신뢰도가 낮으면 감속
-            if self.last_confidence < 0.25:
-                speed = 2
-
-            # 조향이 크면 감속
-            elif abs(angle) > 55:
-                speed = 2
-
-            elif abs(angle) > 35:
-                speed = 3
-
-            # S자 / 커브 감속
-            elif abs(self.last_curve) > 80:
-                speed = 3
-
-            self.drive(
-                angle,
-                speed
+            # 조향이 작을수록 직선 속도에 가까워진다. 단계별 if문 대신
+            # 연속 보간과 저역통과 필터를 사용해 속도 급변을 막는다.
+            turn_ratio = float(np.clip(abs(angle) / 45.0, 0.0, 1.0))
+            target_speed = (
+                self.straight_speed -
+                turn_ratio * (self.straight_speed - self.curve_speed)
             )
+            self.current_speed = (
+                0.92 * self.current_speed +
+                0.08 * target_speed
+            )
+            speed = self.current_speed
 
+            # 둘 이상의 노드가 같은 모터 토픽을 발행하면 명령이 서로
+            # 덮어써지므로, 충돌이 해소될 때까지 이 노드는 정지 명령만 보낸다.
+            if self.count_publishers('/xycar_motor') > 1:
+                speed = 0.0
+
+                if not self.publisher_conflict_reported:
+                    self.get_logger().error(
+                        'Multiple /xycar_motor publishers detected; stopping vehicle'
+                    )
+                    self.publisher_conflict_reported = True
+            else:
+                self.publisher_conflict_reported = False
+
+            self.drive(angle, speed)
             cv2.imshow(
                 "camera",
                 frame
             )
 
             if cv2.waitKey(1) & 0xFF == 27:
+
                 break
 
     # =========================================
@@ -726,15 +1081,20 @@ def main(args=None):
     node = TrackDriverNode()
 
     try:
+
         node.main_loop()
 
     except KeyboardInterrupt:
+
         pass
 
     finally:
+
         node.destroy()
+
         rclpy.shutdown()
 
 
 if __name__ == '__main__':
+
     main()
