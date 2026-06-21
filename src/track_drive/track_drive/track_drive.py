@@ -592,7 +592,7 @@ class TrackDriverNode(Node):
         self.lane_reacquire_frames = 0
         self.lane_reacquire_required = 2
         self.lane_recovery_angle = 90.0
-        self.missing_window_threshold = 3
+        self.single_lane_recovery_angle = 45.0
 
         # publisher
         self.motor_pub = self.create_publisher(
@@ -1021,6 +1021,8 @@ class TrackDriverNode(Node):
         left_lane_detected = self.slidewindow.left_lane_detected
         left_missing_windows = self.slidewindow.left_missing_windows
         right_missing_windows = self.slidewindow.right_missing_windows
+        left_valid_windows = max(0, 10 - left_missing_windows)
+        right_valid_windows = max(0, 10 - right_missing_windows)
 
         # 두 검출기가 같은 실선을 잡은 경우 왼쪽 검출을 무효화한다.
         if left_lane_detected and right_lane_detected:
@@ -1110,8 +1112,8 @@ class TrackDriverNode(Node):
                     0.15 * road_width_lookahead
                 )
 
-            # 양쪽이 모두 보일 때는 왼쪽 기반 추정도 일부 결합해
-            # 흰 장애물 하나가 오른쪽 차선을 끌고 가는 현상을 줄인다.
+            # 양쪽이 모두 보이면 유효 윈도우가 많은 차선에 더 높은
+            # 가중치를 주어 장애물이나 일시적인 오검출 영향을 줄인다.
             left_bottom_center = (
                 left_lane_x + self.road_width_bottom_estimate -
                 self.right_lane_distance_bottom
@@ -1120,11 +1122,19 @@ class TrackDriverNode(Node):
                 left_lane_lookahead + self.road_width_lookahead_estimate -
                 self.right_lane_distance_lookahead
             )
+            total_valid_windows = max(
+                1,
+                left_valid_windows + right_valid_windows
+            )
+            left_weight = left_valid_windows / total_valid_windows
+            right_weight = right_valid_windows / total_valid_windows
             bottom_lane_center = (
-                0.70 * bottom_lane_center + 0.30 * left_bottom_center
+                right_weight * bottom_lane_center +
+                left_weight * left_bottom_center
             )
             lookahead_lane_center = (
-                0.70 * lookahead_lane_center + 0.30 * left_lookahead_center
+                right_weight * lookahead_lane_center +
+                left_weight * left_lookahead_center
             )
 
         # 직선에서는 가까운 중심을 안정적으로 따르고, 코너에서는 먼
@@ -1239,20 +1249,20 @@ class TrackDriverNode(Node):
                 2
             )
 
-        left_windows_lost = (
-            left_missing_windows >= self.missing_window_threshold
-        )
-        right_windows_lost = (
-            right_missing_windows >= self.missing_window_threshold
-        )
-
-        if left_windows_lost and not right_windows_lost:
-            angle = -90.0
-        elif right_windows_lost and not left_windows_lost:
-            angle = 90.0
-        elif left_windows_lost and right_windows_lost:
-            # 양쪽 조건이 충돌하면 PID가 계산한 현재 커브 방향을 따른다.
-            angle = -90.0 if angle < 0.0 else 90.0
+        # 한쪽 실선이 사라져도 반대쪽 유효 윈도우가 4개 이상이면
+        # 그 차선을 신뢰한다. 4개 미만일 때만 LOST 방향으로 복구한다.
+        if (
+            not left_lane_detected and
+            right_lane_detected and
+            right_valid_windows < 4
+        ):
+            angle = -self.single_lane_recovery_angle
+        elif (
+            not right_lane_detected and
+            left_lane_detected and
+            left_valid_windows < 4
+        ):
+            angle = self.single_lane_recovery_angle
 
         # =====================================
         # debug
@@ -1285,7 +1295,7 @@ class TrackDriverNode(Node):
         )
         cv2.putText(
             out_img,
-            f'MISSING WINDOWS L:{left_missing_windows} R:{right_missing_windows}',
+            f'VALID WINDOWS L:{left_valid_windows}/10 R:{right_valid_windows}/10',
             (20, 115),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
