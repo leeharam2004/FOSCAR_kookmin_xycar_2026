@@ -38,9 +38,11 @@ class SlideWindow:
         self.rightx_previous = 580
         self.rightx_lookahead_previous = 500
         self.right_lane_detected = False
+        self.right_missing_windows = 10
         self.leftx_previous = 60
         self.leftx_lookahead_previous = 140
         self.left_lane_detected = False
+        self.left_missing_windows = 10
         self.tracking_top_ratio = 0.28
 
     def slidewindow(self, img):
@@ -48,6 +50,7 @@ class SlideWindow:
         # 이번 프레임에서 실제 차선 픽셀 검증을 끝내기 전까지는
         # 이전 좌표를 반환하더라도 미검출 상태로 취급한다.
         self.right_lane_detected = False
+        self.right_missing_windows = 0
 
         out_img = np.dstack((img, img, img))
 
@@ -220,6 +223,9 @@ class SlideWindow:
                         nonzerox[good_inds]
                     )
                 )
+            else:
+
+                self.right_missing_windows += 1
 
         # concatenate
         if len(right_lane_inds) > 0:
@@ -376,9 +382,17 @@ class SlideWindow:
 
         return out_img, x_location, rightx, rightx_lookahead
 
-    def detect_left_lane(self, img, out_img=None):
+    def detect_left_lane(
+        self,
+        img,
+        out_img=None,
+        right_lane_x=None,
+        right_lane_lookahead=None,
+        right_lane_detected=False,
+    ):
 
         self.left_lane_detected = False
+        self.left_missing_windows = 0
         height, width = img.shape[:2]
         tracking_top = int(height * self.tracking_top_ratio)
         nonzeroy, nonzerox = img.nonzero()
@@ -432,8 +446,39 @@ class SlideWindow:
             else:
                 max_lane_x = int(width * 0.78)
 
+            # 오른쪽 실선이 보이면 같은 선을 왼쪽 윈도우가 따라가지
+            # 못하도록 현재 높이에서 예상한 오른쪽 선과 간격을 둔다.
+            if right_lane_detected:
+                window_center_y = (win_y_low + win_y_high) / 2.0
+                lookahead_y = height * 0.42
+                denominator = max(1.0, (height - 1) - lookahead_y)
+                lookahead_ratio = (
+                    (height - 1) - window_center_y
+                ) / denominator
+                expected_right_x = (
+                    right_lane_x +
+                    lookahead_ratio *
+                    (right_lane_lookahead - right_lane_x)
+                )
+                minimum_gap = float(np.clip(
+                    200.0 - 80.0 * lookahead_ratio,
+                    100.0,
+                    200.0
+                ))
+                max_lane_x = min(
+                    max_lane_x,
+                    int(expected_right_x - minimum_gap)
+                )
+
+            leftx_current = min(
+                leftx_current,
+                max(0, max_lane_x - margin)
+            )
             win_x_low = max(leftx_current - margin, 0)
-            win_x_high = min(leftx_current + margin, max_lane_x)
+            win_x_high = max(
+                win_x_low,
+                min(leftx_current + margin, max_lane_x)
+            )
             if out_img is not None:
                 cv2.rectangle(
                     out_img,
@@ -452,6 +497,8 @@ class SlideWindow:
 
             if len(good_inds) > minpix:
                 leftx_current = int(np.mean(nonzerox[good_inds]))
+            else:
+                self.left_missing_windows += 1
 
         left_lane_inds = np.concatenate(left_lane_inds)
         if len(left_lane_inds) == 0:
@@ -515,7 +562,7 @@ class TrackDriverNode(Node):
 
         # 직선에서는 속도를 높이고 커브에서는 낮춘다. 속도는 아래
         # main_loop에서 연속적으로 보간해 급격한 단계 변화를 방지한다.
-        self.straight_speed = 5.0
+        self.straight_speed = 10.0
         self.curve_speed = 1.5
         self.current_speed = self.curve_speed
         self.max_speed_command = self.straight_speed
@@ -545,6 +592,7 @@ class TrackDriverNode(Node):
         self.lane_reacquire_frames = 0
         self.lane_reacquire_required = 2
         self.lane_recovery_angle = 90.0
+        self.missing_window_threshold = 3
 
         # publisher
         self.motor_pub = self.create_publisher(
@@ -694,10 +742,10 @@ class TrackDriverNode(Node):
         )
 
         road_polygon = np.array([[
-            (int(width * 0.02), height),
-            (int(width * 0.98), height),
-            (int(width * 0.82), int(height * 0.10)),
-            (int(width * 0.18), int(height * 0.10))
+            (0, height),
+            (width - 1, height),
+            (int(width * 0.95), int(height * 0.10)),
+            (int(width * 0.05), int(height * 0.10))
         ]], np.int32)
 
         cv2.fillPoly(
@@ -962,9 +1010,27 @@ class TrackDriverNode(Node):
         )
         right_lane_detected = self.slidewindow.right_lane_detected
         left_lane_x, left_lane_lookahead = (
-            self.slidewindow.detect_left_lane(white_binary, out_img)
+            self.slidewindow.detect_left_lane(
+                white_binary,
+                out_img,
+                right_lane_x,
+                right_lane_lookahead,
+                right_lane_detected,
+            )
         )
         left_lane_detected = self.slidewindow.left_lane_detected
+        left_missing_windows = self.slidewindow.left_missing_windows
+        right_missing_windows = self.slidewindow.right_missing_windows
+
+        # 두 검출기가 같은 실선을 잡은 경우 왼쪽 검출을 무효화한다.
+        if left_lane_detected and right_lane_detected:
+            bottom_separation = right_lane_x - left_lane_x
+            lookahead_separation = (
+                right_lane_lookahead - left_lane_lookahead
+            )
+            if bottom_separation < 220 or lookahead_separation < 120:
+                left_lane_detected = False
+                self.slidewindow.left_lane_detected = False
 
         yellow_info, yellow_debug = self.detect_yellow_centerline(
             yellow_binary
@@ -1173,6 +1239,21 @@ class TrackDriverNode(Node):
                 2
             )
 
+        left_windows_lost = (
+            left_missing_windows >= self.missing_window_threshold
+        )
+        right_windows_lost = (
+            right_missing_windows >= self.missing_window_threshold
+        )
+
+        if left_windows_lost and not right_windows_lost:
+            angle = -90.0
+        elif right_windows_lost and not left_windows_lost:
+            angle = 90.0
+        elif left_windows_lost and right_windows_lost:
+            # 양쪽 조건이 충돌하면 PID가 계산한 현재 커브 방향을 따른다.
+            angle = -90.0 if angle < 0.0 else 90.0
+
         # =====================================
         # debug
         # =====================================
@@ -1200,6 +1281,15 @@ class TrackDriverNode(Node):
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (255, 255, 0) if right_lane_detected else (0, 0, 255),
+            2
+        )
+        cv2.putText(
+            out_img,
+            f'MISSING WINDOWS L:{left_missing_windows} R:{right_missing_windows}',
+            (20, 115),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 165, 255),
             2
         )
 
