@@ -37,8 +37,14 @@ class SlideWindow:
         self.x_previous = 320
         self.rightx_previous = 580
         self.rightx_lookahead_previous = 500
+        self.right_lane_detected = False
+        self.tracking_top_ratio = 0.28
 
     def slidewindow(self, img):
+
+        # 이번 프레임에서 실제 차선 픽셀 검증을 끝내기 전까지는
+        # 이전 좌표를 반환하더라도 미검출 상태로 취급한다.
+        self.right_lane_detected = False
 
         out_img = np.dstack((img, img, img))
 
@@ -130,13 +136,18 @@ class SlideWindow:
         # =====================================
         # sliding window parameter
         # =====================================
-        nwindows = 12
+        # 너무 먼 상단 영역은 장애물을 흰 차선으로 오인할 가능성이
+        # 높으므로 추적하지 않는다. lookahead_y(42%)는 이 범위 안에 있다.
+        tracking_top = int(height * self.tracking_top_ratio)
+        nwindows = 10
 
         window_height = int(
-            height / nwindows
+            (height - tracking_top) / nwindows
         )
 
-        margin = 55
+        # 차선 주변의 장애물 픽셀이 윈도우에 들어오지 않도록 폭을 제한한다.
+        # 실제 바운딩 박스 너비는 margin의 두 배다.
+        margin = 45
 
         minpix = 25
 
@@ -150,6 +161,8 @@ class SlideWindow:
             win_y_low = (
                 height - (window + 1) * window_height
             )
+
+            win_y_low = max(win_y_low, tracking_top)
 
             win_y_high = (
                 height - window * window_height
@@ -329,6 +342,7 @@ class SlideWindow:
         self.rightx_lookahead_previous = rightx_lookahead
 
         self.x_previous = x_location
+        self.right_lane_detected = True
 
         # =====================================
         # debug
@@ -386,8 +400,8 @@ class TrackDriverNode(Node):
 
         # 직선에서는 속도를 높이고 커브에서는 낮춘다. 속도는 아래
         # main_loop에서 연속적으로 보간해 급격한 단계 변화를 방지한다.
-        self.straight_speed = 2.5
-        self.curve_speed = 1.0
+        self.straight_speed = 3.5
+        self.curve_speed = 1.5
         self.current_speed = self.curve_speed
         self.max_speed_command = self.straight_speed
         self.publisher_conflict_reported = False
@@ -411,6 +425,11 @@ class TrackDriverNode(Node):
         # 점선이 잠시 끊겨도 최근 폭을 이용해 차로 중앙을 유지한다.
         self.lane_width_bottom_estimate = 310.0
         self.lane_width_lookahead_estimate = 220.0
+        self.straight_right_bias = 15.0
+        self.right_lane_recovery = False
+        self.right_lane_reacquire_frames = 0
+        self.right_lane_reacquire_required = 2
+        self.right_lane_recovery_angle = 90.0
 
         # publisher
         self.motor_pub = self.create_publisher(
@@ -826,6 +845,25 @@ class TrackDriverNode(Node):
                 white_binary
             )
         )
+        right_lane_detected = self.slidewindow.right_lane_detected
+
+        if right_lane_detected:
+
+            if self.right_lane_recovery:
+                self.right_lane_reacquire_frames += 1
+
+                if (
+                    self.right_lane_reacquire_frames >=
+                    self.right_lane_reacquire_required
+                ):
+                    self.right_lane_recovery = False
+            else:
+                self.right_lane_reacquire_frames = 0
+
+        else:
+
+            self.right_lane_recovery = True
+            self.right_lane_reacquire_frames = 0
 
         yellow_info, yellow_debug = self.detect_yellow_centerline(
             yellow_binary
@@ -849,7 +887,7 @@ class TrackDriverNode(Node):
             self.lane_width_lookahead_estimate / 2.0
         )
 
-        if yellow_info is not None:
+        if yellow_info is not None and right_lane_detected:
 
             yellow_center_x = yellow_info["bottom_x"]
             yellow_lookahead_x = yellow_info["lookahead_x"]
@@ -898,6 +936,16 @@ class TrackDriverNode(Node):
             0.70 * bottom_lane_center +
             0.30 * lookahead_lane_center
         )
+
+        # 가까운 중심과 전방 중심이 나란한 직선에서만 목표를 오른쪽
+        # 흰선 방향으로 옮긴다. 커브에서는 보정량을 연속적으로 줄인다.
+        center_delta = abs(bottom_lane_center - lookahead_lane_center)
+        straight_ratio = float(np.clip(
+            1.0 - center_delta / 60.0,
+            0.0,
+            1.0
+        ))
+        lane_center += int(self.straight_right_bias * straight_ratio)
 
         # 노란선이 차량 쪽으로 가까워질 때만 추가로 오른쪽에 여유를 둔다.
         if yellow_center_x is not None:
@@ -978,6 +1026,25 @@ class TrackDriverNode(Node):
         )
 
         angle *= -1
+
+        # 미검출 중에는 오른쪽 최대 조향을 유지한다. 첫 재검출
+        # 프레임은 직진하고, 두 번째 연속 검출부터 PID로 즉시 복귀한다.
+        if self.right_lane_recovery:
+            if right_lane_detected:
+                angle = 0.0
+            else:
+                angle = self.right_lane_recovery_angle
+
+            self.integral = 0.0
+            cv2.putText(
+                out_img,
+                'RIGHT LANE LOST - RECOVERING',
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
 
         # =====================================
         # debug
