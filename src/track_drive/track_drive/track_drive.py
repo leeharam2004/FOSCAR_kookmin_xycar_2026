@@ -23,7 +23,7 @@ import numpy as np
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int64MultiArray
+from std_msgs.msg import Int64MultiArray, Bool
 from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
@@ -436,6 +436,9 @@ class TrackDriverNode(Node):
             10
         )
 
+        self.pedestrian_blocking = False
+        self.create_subscription(Bool, '/pedestrian_detected', self._pedestrian_callback, 10)
+
         self.get_logger().info(
             "===== Enhanced Lane Driving Start ====="
         )
@@ -449,6 +452,9 @@ class TrackDriverNode(Node):
             data,
             "bgr8"
         )
+
+    def _pedestrian_callback(self, msg):
+        self.pedestrian_blocking = msg.data
 
     def traffic_light_callback(self, message):
 
@@ -1095,19 +1101,19 @@ class TrackDriverNode(Node):
             )
             speed = self.current_speed
 
-            if not self.driving_enabled:
+            if not self.driving_enabled or self.pedestrian_blocking:
                 speed = 0.0
 
             # 둘 이상의 노드가 같은 모터 토픽을 발행하면 명령이 서로
-            # 덮어써지므로, 충돌이 해소될 때까지 이 노드는 정지 명령만 보낸다.
+            # 덮어써지므로, 충돌이 해소될 때까지 이 노드는 퍼블리시 자체를 건너뛴다.
             if self.count_publishers('/xycar_motor') > 1:
-                speed = 0.0
-
                 if not self.publisher_conflict_reported:
                     self.get_logger().error(
-                        'Multiple /xycar_motor publishers detected; stopping vehicle'
+                        'Multiple /xycar_motor publishers detected; skipping publish'
                     )
                     self.publisher_conflict_reported = True
+                cv2.waitKey(1)
+                continue
             else:
                 self.publisher_conflict_reported = False
 

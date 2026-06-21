@@ -44,6 +44,30 @@ def generate_launch_description():
         parameters=[]
     )
 
+    # Pedestrian detection via LiDAR clustering
+    pedestrian_detector_node = Node(
+        package='track_drive',
+        executable='pedestrian_detector',
+        output='screen',
+        parameters=[]
+    )
+
+    # Traffic light detection
+    traffic_light_node = Node(
+        package='track_drive',
+        executable='traffic_light',
+        output='screen',
+        parameters=[]
+    )
+
+    # Lane following
+    track_drive_node = Node(
+        package='track_drive',
+        executable='track_drive',
+        output='log',
+        parameters=[]
+    )
+
     # 3. Static TF (base_link -> laser_frame)
     # 나중에 시뮬에서 주는 Static TF로 바꾸기
     static_tf_node = Node(
@@ -83,5 +107,8 @@ def generate_launch_description():
         static_tf_node,
         # slam_toolbox_launch,
         nav2_launch,
+        pedestrian_detector_node,
+        traffic_light_node,
+        track_drive_node,
         goal_sender_node,
     ])

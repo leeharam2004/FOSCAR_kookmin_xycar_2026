@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
             'track_drive = track_drive.track_drive:main',
             'traffic_light = track_drive.traffic_Light:main',
+            'pedestrian_detector = track_drive.pedestrian_detector:main',
         ],
     },
 )

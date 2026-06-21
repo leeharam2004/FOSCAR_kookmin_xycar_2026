@@ -1,10 +1,12 @@
 import math
+import subprocess
 import time
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import FollowWaypoints
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from std_msgs.msg import Int64MultiArray
 
 
 # (x, y, ori_z, ori_w)
@@ -28,19 +30,34 @@ def make_pose(node, x, y, ori_z, ori_w):
     return p
 
 
+GREEN_PIXEL_THRESHOLD = 30
+
+
 class GoalSenderNode(Node):
     def __init__(self):
         super().__init__('goal_sender')
         self._initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, '/initialpose', 10)
         self._client = ActionClient(self, FollowWaypoints, 'follow_waypoints')
+        self._green_detected = False
+        self.create_subscription(Int64MultiArray, '/traffic_light', self._traffic_light_callback, 10)
         self.get_logger().info('Waiting for follow_waypoints action server...')
         self._client.wait_for_server()
         time.sleep(7)
+        self.get_logger().info('Waiting for green light...')
+        self._wait_for_green()
         self._send_goal()
-        self.get_logger().info('Waiting 3s before sending waypoints...')
+        self.get_logger().info('Waiting 1s before sending waypoints...')
         time.sleep(1)
         self._publish_initial_pose()
+
+    def _traffic_light_callback(self, msg):
+        if msg.data[1] >= GREEN_PIXEL_THRESHOLD:
+            self._green_detected = True
+
+    def _wait_for_green(self):
+        while rclpy.ok() and not self._green_detected:
+            rclpy.spin_once(self, timeout_sec=0.1)
 
     def _publish_initial_pose(self):
         x, y, yaw = INITIAL_POSE
@@ -61,8 +78,32 @@ class GoalSenderNode(Node):
     def _send_goal(self):
         goal = FollowWaypoints.Goal()
         goal.poses = [make_pose(self, x, y, oz, ow) for x, y, oz, ow in WAYPOINTS]
-        self._client.send_goal_async(goal)
+        future = self._client.send_goal_async(goal)
+        future.add_done_callback(self._goal_response_callback)
         self.get_logger().info(f'Sent {len(goal.poses)} waypoints.')
+
+    def _goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Goal rejected by Nav2')
+            return
+        goal_handle.get_result_async().add_done_callback(self._result_callback)
+
+    def _result_callback(self, future):
+        self.get_logger().info('All waypoints completed — killing motor_translator')
+
+        # [현재: 방법 1] motor_translator 프로세스를 직접 종료 → count_publishers가 1로 떨어져 track_drive 활성화
+        subprocess.Popen(['pkill', '-f', 'motor_translator'])
+        # Nav2 컨테이너 전체 종료 (차선 주행 단계에서 불필요한 CPU 절감)
+        # subprocess.Popen(['pkill', '-f', 'component_container_isolated'])
+
+        # [방법 2로 바꾸려면 이 블록 대신]:
+        # motor_translator는 그냥 놔두고, track_drive.py 쪽을 수정
+        # track_drive.py의 drive() 또는 타이머 콜백에서:
+        #   self.last_motor_msg_time = self.get_clock().now()  ← motor_translator 토픽 수신 시 갱신
+        #   dt = (now - self.last_motor_msg_time).nanoseconds / 1e9
+        #   if dt > 0.5: # 0.5초 이상 motor_translator 메시지 없으면 넘어감
+        #       count_publishers 체크 스킵하고 track_drive 활성화
 
 
 def main(args=None):

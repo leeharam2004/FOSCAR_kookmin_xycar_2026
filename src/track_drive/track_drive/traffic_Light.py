@@ -4,6 +4,14 @@ import cv2
 import numpy as np
 import rclpy
 
+# False로 설정하면 모든 cv2 창을 띄우지 않고 하드코딩 상수로 HSV 범위를 사용한다.
+DEBUG = False
+
+_RED_LOWER  = np.array([  0, 170, 120], dtype=np.uint8)
+_RED_UPPER  = np.array([ 10, 255, 255], dtype=np.uint8)
+_GREEN_LOWER = np.array([ 38, 165, 120], dtype=np.uint8)
+_GREEN_UPPER = np.array([102, 255, 255], dtype=np.uint8)
+
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -49,6 +57,8 @@ class TrafficDetection(Node):
         self.get_logger().info('ROS2 traffic-light detector started')
 
     def _create_debug_windows(self):
+        if not DEBUG:
+            return
         cv2.namedWindow('Red Trackbars', cv2.WINDOW_NORMAL)
         cv2.createTrackbar('H_min_red1', 'Red Trackbars', 0, 179, self.nothing)
         cv2.createTrackbar('H_max_red1', 'Red Trackbars', 10, 179, self.nothing)
@@ -60,7 +70,7 @@ class TrafficDetection(Node):
         cv2.namedWindow('Green Trackbars', cv2.WINDOW_NORMAL)
         cv2.createTrackbar('H_min_green1', 'Green Trackbars', 38, 179, self.nothing)
         cv2.createTrackbar('H_max_green1', 'Green Trackbars', 102, 179, self.nothing)
-        cv2.createTrackbar('S_min_green1', 'Green Trackbars', 170, 255, self.nothing)
+        cv2.createTrackbar('S_min_green1', 'Green Trackbars', 165, 255, self.nothing)
         cv2.createTrackbar('S_max_green1', 'Green Trackbars', 255, 255, self.nothing)
         cv2.createTrackbar('V_min_green1', 'Green Trackbars', 120, 255, self.nothing)
         cv2.createTrackbar('V_max_green1', 'Green Trackbars', 255, 255, self.nothing)
@@ -77,7 +87,8 @@ class TrafficDetection(Node):
             return
 
         self.detect_traffic_light(image)
-        cv2.waitKey(1)
+        if DEBUG:
+            cv2.waitKey(1)
 
     @staticmethod
     def filter_circular_contours(
@@ -131,6 +142,10 @@ class TrafficDetection(Node):
 
     @staticmethod
     def _trackbar_range(prefix, window):
+        if not DEBUG:
+            if prefix == 'red1':
+                return _RED_LOWER.copy(), _RED_UPPER.copy()
+            return _GREEN_LOWER.copy(), _GREEN_UPPER.copy()
         lower = np.array([
             cv2.getTrackbarPos(f'H_min_{prefix}', window),
             cv2.getTrackbarPos(f'S_min_{prefix}', window),
@@ -212,24 +227,25 @@ class TrafficDetection(Node):
         red_centers = self.get_contour_centers(red_filtered)
         green_centers = self.get_contour_centers(green_filtered)
 
-        cv2.putText(
-            green_result,
-            f'green pixels: {green_pixel_count}',
-            (15, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            255,
-            2,
-        )
-        cv2.putText(
-            red_result,
-            f'red pixels: {red_pixel_count}',
-            (15, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            255,
-            2,
-        )
+        if DEBUG:
+            cv2.putText(
+                green_result,
+                f'green pixels: {green_pixel_count}',
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                255,
+                2,
+            )
+            cv2.putText(
+                red_result,
+                f'red pixels: {red_pixel_count}',
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                255,
+                2,
+            )
 
         traffic_message = Int64MultiArray()
         traffic_message.data = [red_pixel_count, green_pixel_count]
@@ -251,22 +267,23 @@ class TrafficDetection(Node):
         ]
         self.green_center_pub.publish(green_centers_message)
 
-        debug_image = image.copy()
-        cv2.rectangle(
-            debug_image,
-            (0, roi_top),
-            (width - 1, max(roi_top, roi_bottom - 1)),
-            (255, 255, 0),
-            2,
-        )
-        cv2.imshow('src', debug_image)
-        cv2.imshow('red_mask', red_mask)
-        cv2.imshow('green_mask', green_mask)
-        cv2.imshow('red_result', red_result)
-        cv2.imshow('green_result', green_result)
-        cv2.imshow('h', hue)
-        cv2.imshow('s', saturation)
-        cv2.imshow('v', value)
+        if DEBUG:
+            debug_image = image.copy()
+            cv2.rectangle(
+                debug_image,
+                (0, roi_top),
+                (width - 1, max(roi_top, roi_bottom - 1)),
+                (255, 255, 0),
+                2,
+            )
+            cv2.imshow('src', debug_image)
+            cv2.imshow('red_mask', red_mask)
+            cv2.imshow('green_mask', green_mask)
+            cv2.imshow('red_result', red_result)
+            cv2.imshow('green_result', green_result)
+            cv2.imshow('h', hue)
+            cv2.imshow('s', saturation)
+            cv2.imshow('v', value)
 
 
 def main(args=None):
