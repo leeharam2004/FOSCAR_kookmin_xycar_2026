@@ -15,15 +15,13 @@
 # 6. 커브길 곡선 2번째 까진 안정적 통과후 직진후 차선이탈 문제
 # =============================================
 
-#commit test
-
 import rclpy
 import cv2
 import numpy as np
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int64MultiArray, Bool
+from std_msgs.msg import Int64MultiArray
 from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
@@ -39,8 +37,20 @@ class SlideWindow:
         self.x_previous = 320
         self.rightx_previous = 580
         self.rightx_lookahead_previous = 500
+        self.right_lane_detected = False
+        self.right_missing_windows = 10
+        self.leftx_previous = 60
+        self.leftx_lookahead_previous = 140
+        self.left_lane_detected = False
+        self.left_missing_windows = 10
+        self.tracking_top_ratio = 0.28
 
     def slidewindow(self, img):
+
+        # 이번 프레임에서 실제 차선 픽셀 검증을 끝내기 전까지는
+        # 이전 좌표를 반환하더라도 미검출 상태로 취급한다.
+        self.right_lane_detected = False
+        self.right_missing_windows = 0
 
         out_img = np.dstack((img, img, img))
 
@@ -132,13 +142,18 @@ class SlideWindow:
         # =====================================
         # sliding window parameter
         # =====================================
-        nwindows = 12
+        # 너무 먼 상단 영역은 장애물을 흰 차선으로 오인할 가능성이
+        # 높으므로 추적하지 않는다. lookahead_y(42%)는 이 범위 안에 있다.
+        tracking_top = int(height * self.tracking_top_ratio)
+        nwindows = 10
 
         window_height = int(
-            height / nwindows
+            (height - tracking_top) / nwindows
         )
 
-        margin = 55
+        # 차선 주변의 장애물 픽셀이 윈도우에 들어오지 않도록 폭을 제한한다.
+        # 실제 바운딩 박스 너비는 margin의 두 배다.
+        margin = 45
 
         minpix = 25
 
@@ -152,6 +167,8 @@ class SlideWindow:
             win_y_low = (
                 height - (window + 1) * window_height
             )
+
+            win_y_low = max(win_y_low, tracking_top)
 
             win_y_high = (
                 height - window * window_height
@@ -206,6 +223,9 @@ class SlideWindow:
                         nonzerox[good_inds]
                     )
                 )
+            else:
+
+                self.right_missing_windows += 1
 
         # concatenate
         if len(right_lane_inds) > 0:
@@ -331,6 +351,7 @@ class SlideWindow:
         self.rightx_lookahead_previous = rightx_lookahead
 
         self.x_previous = x_location
+        self.right_lane_detected = True
 
         # =====================================
         # debug
@@ -361,6 +382,159 @@ class SlideWindow:
 
         return out_img, x_location, rightx, rightx_lookahead
 
+    def detect_left_lane(
+        self,
+        img,
+        out_img=None,
+        right_lane_x=None,
+        right_lane_lookahead=None,
+        right_lane_detected=False,
+    ):
+
+        self.left_lane_detected = False
+        self.left_missing_windows = 0
+        height, width = img.shape[:2]
+        tracking_top = int(height * self.tracking_top_ratio)
+        nonzeroy, nonzerox = img.nonzero()
+
+        # 왼쪽 실선이 카메라 중앙 부근까지 들어오는 S자 구간도 허용한다.
+        left_limit = int(width * 0.55)
+        left_region = img[int(height * 0.55):height, 0:left_limit]
+        histogram = np.sum(left_region, axis=0)
+
+        if len(histogram) == 0 or np.max(histogram) < 255 * 20:
+            leftx_current = int(np.clip(
+                self.leftx_previous,
+                0,
+                left_limit
+            ))
+        else:
+            smooth_histogram = np.convolve(
+                histogram,
+                np.ones(9),
+                mode='same'
+            )
+            peak_value = np.max(smooth_histogram)
+            candidate_x = np.where(
+                smooth_histogram > peak_value * 0.35
+            )[0]
+
+            if len(candidate_x) == 0:
+                leftx_current = int(np.argmax(smooth_histogram))
+            else:
+                leftx_current = int(candidate_x[
+                    np.argmin(np.abs(candidate_x - self.leftx_previous))
+                ])
+
+        nwindows = 10
+        window_height = max(1, int(
+            (height - tracking_top) / nwindows
+        ))
+        margin = 45
+        minpix = 25
+        left_lane_inds = []
+
+        for window in range(nwindows):
+            win_y_low = max(
+                height - (window + 1) * window_height,
+                tracking_top
+            )
+            win_y_high = height - window * window_height
+
+            if win_y_low > int(height * 0.45):
+                max_lane_x = int(width * 0.58)
+            else:
+                max_lane_x = int(width * 0.78)
+
+            # 오른쪽 실선이 보이면 같은 선을 왼쪽 윈도우가 따라가지
+            # 못하도록 현재 높이에서 예상한 오른쪽 선과 간격을 둔다.
+            if right_lane_detected:
+                window_center_y = (win_y_low + win_y_high) / 2.0
+                lookahead_y = height * 0.42
+                denominator = max(1.0, (height - 1) - lookahead_y)
+                lookahead_ratio = (
+                    (height - 1) - window_center_y
+                ) / denominator
+                expected_right_x = (
+                    right_lane_x +
+                    lookahead_ratio *
+                    (right_lane_lookahead - right_lane_x)
+                )
+                minimum_gap = float(np.clip(
+                    200.0 - 80.0 * lookahead_ratio,
+                    100.0,
+                    200.0
+                ))
+                max_lane_x = min(
+                    max_lane_x,
+                    int(expected_right_x - minimum_gap)
+                )
+
+            leftx_current = min(
+                leftx_current,
+                max(0, max_lane_x - margin)
+            )
+            win_x_low = max(leftx_current - margin, 0)
+            win_x_high = max(
+                win_x_low,
+                min(leftx_current + margin, max_lane_x)
+            )
+            if out_img is not None:
+                cv2.rectangle(
+                    out_img,
+                    (win_x_low, win_y_low),
+                    (win_x_high, win_y_high),
+                    (255, 0, 255),
+                    2
+                )
+            good_inds = (
+                (nonzeroy >= win_y_low) &
+                (nonzeroy < win_y_high) &
+                (nonzerox >= win_x_low) &
+                (nonzerox < win_x_high)
+            ).nonzero()[0]
+            left_lane_inds.append(good_inds)
+
+            if len(good_inds) > minpix:
+                leftx_current = int(np.mean(nonzerox[good_inds]))
+            else:
+                self.left_missing_windows += 1
+
+        left_lane_inds = np.concatenate(left_lane_inds)
+        if len(left_lane_inds) == 0:
+            return self.leftx_previous, self.leftx_lookahead_previous
+
+        lane_x = nonzerox[left_lane_inds]
+        lane_y = nonzeroy[left_lane_inds]
+        lower_lane = lane_y > int(height * 0.55)
+
+        if np.count_nonzero(lower_lane) < minpix:
+            return self.leftx_previous, self.leftx_lookahead_previous
+
+        lower_median_x = np.median(lane_x[lower_lane])
+        if lower_median_x > int(width * 0.55):
+            return self.leftx_previous, self.leftx_lookahead_previous
+
+        lookahead_y = int(height * 0.42)
+        if len(lane_x) >= 50:
+            fit = np.polyfit(lane_y, lane_x, 2)
+            leftx = int(np.polyval(fit, height - 1))
+            leftx_lookahead = int(np.polyval(fit, lookahead_y))
+        else:
+            leftx = int(lower_median_x)
+            leftx_lookahead = leftx
+
+        leftx = int(np.clip(leftx, 0, int(width * 0.55)))
+        leftx_lookahead = int(np.clip(
+            leftx_lookahead,
+            0,
+            int(width * 0.78)
+        ))
+        self.leftx_previous = leftx
+        self.leftx_lookahead_previous = leftx_lookahead
+        self.left_lane_detected = True
+        return leftx, leftx_lookahead
+
 
 # =============================================
 # ROS2 Node
@@ -388,8 +562,8 @@ class TrackDriverNode(Node):
 
         # 직선에서는 속도를 높이고 커브에서는 낮춘다. 속도는 아래
         # main_loop에서 연속적으로 보간해 급격한 단계 변화를 방지한다.
-        self.straight_speed = 2.5
-        self.curve_speed = 1.0
+        self.straight_speed = 10.0
+        self.curve_speed = 1.5
         self.current_speed = self.curve_speed
         self.max_speed_command = self.straight_speed
         self.publisher_conflict_reported = False
@@ -409,10 +583,16 @@ class TrackDriverNode(Node):
 
         self.yellow_miss_count = 0
 
-        # 노란 왼쪽 경계와 흰색 오른쪽 경계 사이의 차로 폭 추정값이다.
-        # 점선이 잠시 끊겨도 최근 폭을 이용해 차로 중앙을 유지한다.
-        self.lane_width_bottom_estimate = 310.0
-        self.lane_width_lookahead_estimate = 220.0
+        # 왼쪽·오른쪽 흰색 실선 사이의 전체 트랙 폭 추정값이다.
+        self.road_width_bottom_estimate = 520.0
+        self.road_width_lookahead_estimate = 360.0
+        self.right_lane_distance_bottom = 200.0
+        self.right_lane_distance_lookahead = 140.0
+        self.lane_recovery = False
+        self.lane_reacquire_frames = 0
+        self.lane_reacquire_required = 2
+        self.lane_recovery_angle = 90.0
+        self.single_lane_recovery_angle = 45.0
 
         # publisher
         self.motor_pub = self.create_publisher(
@@ -437,7 +617,6 @@ class TrackDriverNode(Node):
         )
 
         self.pedestrian_blocking = False
-        self.create_subscription(Bool, '/pedestrian_detected', self._pedestrian_callback, 10)
 
         self.get_logger().info(
             "===== Enhanced Lane Driving Start ====="
@@ -452,9 +631,6 @@ class TrackDriverNode(Node):
             data,
             "bgr8"
         )
-
-    def _pedestrian_callback(self, msg):
-        self.pedestrian_blocking = msg.data
 
     def traffic_light_callback(self, message):
 
@@ -568,10 +744,10 @@ class TrackDriverNode(Node):
         )
 
         road_polygon = np.array([[
-            (int(width * 0.02), height),
-            (int(width * 0.98), height),
-            (int(width * 0.82), int(height * 0.10)),
-            (int(width * 0.18), int(height * 0.10))
+            (0, height),
+            (width - 1, height),
+            (int(width * 0.95), int(height * 0.10)),
+            (int(width * 0.05), int(height * 0.10))
         ]], np.int32)
 
         cv2.fillPoly(
@@ -834,88 +1010,145 @@ class TrackDriverNode(Node):
                 white_binary
             )
         )
+        right_lane_detected = self.slidewindow.right_lane_detected
+        left_lane_x, left_lane_lookahead = (
+            self.slidewindow.detect_left_lane(
+                white_binary,
+                out_img,
+                right_lane_x,
+                right_lane_lookahead,
+                right_lane_detected,
+            )
+        )
+        left_lane_detected = self.slidewindow.left_lane_detected
+        left_missing_windows = self.slidewindow.left_missing_windows
+        right_missing_windows = self.slidewindow.right_missing_windows
+        left_valid_windows = max(0, 10 - left_missing_windows)
+        right_valid_windows = max(0, 10 - right_missing_windows)
+
+        # 두 검출기가 같은 실선을 잡은 경우 왼쪽 검출을 무효화한다.
+        if left_lane_detected and right_lane_detected:
+            bottom_separation = right_lane_x - left_lane_x
+            lookahead_separation = (
+                right_lane_lookahead - left_lane_lookahead
+            )
+            if bottom_separation < 220 or lookahead_separation < 120:
+                left_lane_detected = False
+                self.slidewindow.left_lane_detected = False
 
         yellow_info, yellow_debug = self.detect_yellow_centerline(
             yellow_binary
         )
+        lane_detected = right_lane_detected or left_lane_detected
+
+        if lane_detected:
+
+            if self.lane_recovery:
+                self.lane_reacquire_frames += 1
+
+                if (
+                    self.lane_reacquire_frames >=
+                    self.lane_reacquire_required
+                ):
+                    self.lane_recovery = False
+            else:
+                self.lane_reacquire_frames = 0
+
+        else:
+
+            self.lane_recovery = True
+            self.lane_reacquire_frames = 0
 
         # =====================================
         # target center
         # =====================================
         target = 320
-        centerline_guard_x = target - 85
         yellow_center_x = None
         yellow_lookahead_x = None
 
-        # 노란 점선이 끊긴 프레임의 기본값: 최근 차로 폭과 오른쪽
-        # 경계로 차로의 실제 중점을 계산한다.
-        bottom_lane_center = (
-            right_lane_x - self.lane_width_bottom_estimate / 2.0
-        )
-        lookahead_lane_center = (
-            right_lane_lookahead -
-            self.lane_width_lookahead_estimate / 2.0
-        )
-
         if yellow_info is not None:
-
             yellow_center_x = yellow_info["bottom_x"]
             yellow_lookahead_x = yellow_info["lookahead_x"]
 
-            lane_width_bottom = right_lane_x - yellow_center_x
-            lane_width_lookahead = (
-                right_lane_lookahead - yellow_lookahead_x
+        # 오른쪽 실선이 보이면 설정한 간격으로 목표 주행선을 만든다.
+        if right_lane_detected:
+            bottom_lane_center = (
+                right_lane_x - self.right_lane_distance_bottom
+            )
+            lookahead_lane_center = (
+                right_lane_lookahead -
+                self.right_lane_distance_lookahead
+            )
+        # 오른쪽 실선이 사라지면 최근 전체 트랙 폭과 왼쪽 흰색 실선으로
+        # 동일한 목표 주행선을 추정한다.
+        elif left_lane_detected:
+            bottom_lane_center = (
+                left_lane_x + self.road_width_bottom_estimate -
+                self.right_lane_distance_bottom
+            )
+            lookahead_lane_center = (
+                left_lane_lookahead + self.road_width_lookahead_estimate -
+                self.right_lane_distance_lookahead
+            )
+        else:
+            bottom_lane_center = float(target)
+            lookahead_lane_center = float(target)
+
+        if left_lane_detected and right_lane_detected:
+            road_width_bottom = right_lane_x - left_lane_x
+            road_width_lookahead = (
+                right_lane_lookahead - left_lane_lookahead
             )
 
-            if 170 <= lane_width_bottom <= 430:
+            if 300 <= road_width_bottom <= 630:
 
-                self.lane_width_bottom_estimate = (
-                    0.85 * self.lane_width_bottom_estimate +
-                    0.15 * lane_width_bottom
-                )
-                bottom_lane_center = (
-                    yellow_center_x + right_lane_x
-                ) / 2.0
-
-            else:
-
-                bottom_lane_center = (
-                    yellow_center_x +
-                    self.lane_width_bottom_estimate / 2.0
+                self.road_width_bottom_estimate = (
+                    0.85 * self.road_width_bottom_estimate +
+                    0.15 * road_width_bottom
                 )
 
-            if 130 <= lane_width_lookahead <= 390:
+            if 180 <= road_width_lookahead <= 550:
 
-                self.lane_width_lookahead_estimate = (
-                    0.85 * self.lane_width_lookahead_estimate +
-                    0.15 * lane_width_lookahead
-                )
-                lookahead_lane_center = (
-                    yellow_lookahead_x + right_lane_lookahead
-                ) / 2.0
-
-            else:
-
-                lookahead_lane_center = (
-                    yellow_lookahead_x +
-                    self.lane_width_lookahead_estimate / 2.0
+                self.road_width_lookahead_estimate = (
+                    0.85 * self.road_width_lookahead_estimate +
+                    0.15 * road_width_lookahead
                 )
 
-        # 가까운 중점을 주로 사용하고 먼 중점으로 커브를 미리 반영한다.
+            # 양쪽이 모두 보이면 유효 윈도우가 많은 차선에 더 높은
+            # 가중치를 주어 장애물이나 일시적인 오검출 영향을 줄인다.
+            left_bottom_center = (
+                left_lane_x + self.road_width_bottom_estimate -
+                self.right_lane_distance_bottom
+            )
+            left_lookahead_center = (
+                left_lane_lookahead + self.road_width_lookahead_estimate -
+                self.right_lane_distance_lookahead
+            )
+            total_valid_windows = max(
+                1,
+                left_valid_windows + right_valid_windows
+            )
+            left_weight = left_valid_windows / total_valid_windows
+            right_weight = right_valid_windows / total_valid_windows
+            bottom_lane_center = (
+                right_weight * bottom_lane_center +
+                left_weight * left_bottom_center
+            )
+            lookahead_lane_center = (
+                right_weight * lookahead_lane_center +
+                left_weight * left_lookahead_center
+            )
+
+        # 직선에서는 가까운 중심을 안정적으로 따르고, 코너에서는 먼
+        # 중심의 비중을 최대 50%까지 높여 조향을 더 일찍 시작한다.
+        center_delta = abs(bottom_lane_center - lookahead_lane_center)
+        curve_strength = float(np.clip(center_delta / 80.0, 0.0, 1.0))
+        lookahead_weight = 0.30 + 0.20 * curve_strength
+        bottom_weight = 1.0 - lookahead_weight
         lane_center = int(
-            0.70 * bottom_lane_center +
-            0.30 * lookahead_lane_center
+            bottom_weight * bottom_lane_center +
+            lookahead_weight * lookahead_lane_center
         )
-
-        # 노란선이 차량 쪽으로 가까워질 때만 추가로 오른쪽에 여유를 둔다.
-        if yellow_center_x is not None:
-
-            centerline_error = max(
-                0,
-                yellow_center_x - centerline_guard_x
-            )
-
-            lane_center += int(centerline_error * 0.8)
 
         lane_center = int(
             np.clip(
@@ -926,16 +1159,22 @@ class TrackDriverNode(Node):
         )
 
         curve_delta = (
-            right_lane_x - right_lane_lookahead
+            bottom_lane_center - lookahead_lane_center
         )
 
-        curve_feedforward = float(
-            np.clip(
-                curve_delta * 0.22,
-                -22,
-                22
-            )
-        )
+        if curve_delta > 0.0:
+            # 왼쪽 커브는 더 먼 시점부터 강하게 선행 조향한다.
+            curve_feedforward = float(np.clip(
+                curve_delta * 0.45,
+                0,
+                40
+            ))
+        else:
+            curve_feedforward = float(np.clip(
+                curve_delta * 0.32,
+                -30,
+                0
+            ))
 
         # =====================================
         # error
@@ -987,6 +1226,46 @@ class TrackDriverNode(Node):
 
         angle *= -1
 
+        # 차량이 왼쪽 커브에서 언더스티어하는 특성을 보정한다.
+        # 곡률이 클수록 왼쪽 조향만 최대 40% 증폭한다.
+        if angle < 0.0:
+            left_curve_gain = 1.0 + 0.40 * curve_strength
+            angle = max(angle * left_curve_gain, -90.0)
+
+        # 미검출 중에는 오른쪽 최대 조향을 유지한다. 첫 재검출
+        # 프레임은 직진하고, 두 번째 연속 검출부터 PID로 즉시 복귀한다.
+        if self.lane_recovery:
+            if lane_detected:
+                angle = 0.0
+            else:
+                angle = self.lane_recovery_angle
+
+            self.integral = 0.0
+            cv2.putText(
+                out_img,
+                'BOTH LANES LOST - RECOVERING',
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
+
+        # 한쪽 실선이 사라져도 반대쪽 유효 윈도우가 4개 이상이면
+        # 그 차선을 신뢰한다. 4개 미만일 때만 LOST 방향으로 복구한다.
+        if (
+            not left_lane_detected and
+            right_lane_detected and
+            right_valid_windows < 4
+        ):
+            angle = -self.single_lane_recovery_angle
+        elif (
+            not right_lane_detected and
+            left_lane_detected and
+            left_valid_windows < 4
+        ):
+            angle = self.single_lane_recovery_angle
+
         # =====================================
         # debug
         # =====================================
@@ -998,13 +1277,49 @@ class TrackDriverNode(Node):
             2
         )
 
-        cv2.line(
+        cv2.putText(
             out_img,
-            (centerline_guard_x, 0),
-            (centerline_guard_x, out_img.shape[0]),
+            f'LEFT WHITE: {"TRACKED" if left_lane_detected else "LOST"}',
+            (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 0, 255) if left_lane_detected else (0, 0, 255),
+            2
+        )
+        cv2.putText(
+            out_img,
+            f'RIGHT WHITE: {"TRACKED" if right_lane_detected else "LOST"}',
+            (20, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0) if right_lane_detected else (0, 0, 255),
+            2
+        )
+        cv2.putText(
+            out_img,
+            f'VALID WINDOWS L:{left_valid_windows}/10 R:{right_valid_windows}/10',
+            (20, 115),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
             (0, 165, 255),
             2
         )
+
+        if left_lane_detected:
+            cv2.line(
+                out_img,
+                (left_lane_x, 0),
+                (left_lane_x, out_img.shape[0]),
+                (255, 0, 255),
+                2
+            )
+            cv2.circle(
+                out_img,
+                (left_lane_lookahead, int(out_img.shape[0] * 0.42)),
+                8,
+                (255, 0, 255),
+                -1
+            )
 
         if yellow_center_x is not None:
 
@@ -1024,13 +1339,13 @@ class TrackDriverNode(Node):
                 -1
             )
 
-            cv2.circle(
-                out_img,
-                (lane_center, out_img.shape[0] - 60),
-                8,
-                (255, 0, 255),
-                -1
-            )
+        cv2.circle(
+            out_img,
+            (lane_center, out_img.shape[0] - 60),
+            8,
+            (255, 0, 255),
+            -1
+        )
 
         binary = cv2.bitwise_or(
             white_binary,
@@ -1060,6 +1375,10 @@ class TrackDriverNode(Node):
         print("yellow_lookahead_x:", yellow_lookahead_x)
         print("right_lane_x:", right_lane_x)
         print("right_lane_lookahead:", right_lane_lookahead)
+        print("left_lane_x:", left_lane_x)
+        print("left_lane_lookahead:", left_lane_lookahead)
+        print("left_lane_detected:", left_lane_detected)
+        print("right_lane_detected:", right_lane_detected)
         print("curve_feedforward:", curve_feedforward)
 
         return angle
@@ -1090,7 +1409,11 @@ class TrackDriverNode(Node):
             # =================================
             # 조향이 작을수록 직선 속도에 가까워진다. 단계별 if문 대신
             # 연속 보간과 저역통과 필터를 사용해 속도 급변을 막는다.
-            turn_ratio = float(np.clip(abs(angle) / 45.0, 0.0, 1.0))
+            # 작은 조향에서는 감속을 최소화하고, 큰 조향부터 빠르게
+            # 커브 속도로 내려가도록 비선형 속도 곡선을 사용한다.
+            turn_ratio = float(
+                np.clip(abs(angle) / 45.0, 0.0, 1.0) ** 1.6
+            )
             target_speed = (
                 self.straight_speed -
                 turn_ratio * (self.straight_speed - self.curve_speed)
