@@ -21,6 +21,7 @@ import numpy as np
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import Int64MultiArray
 from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
@@ -385,16 +386,31 @@ class TrackDriverNode(Node):
 
         # 직선에서는 속도를 높이고 커브에서는 낮춘다. 속도는 아래
         # main_loop에서 연속적으로 보간해 급격한 단계 변화를 방지한다.
-        self.straight_speed = 2.0
+        self.straight_speed = 2.5
         self.curve_speed = 1.0
         self.current_speed = self.curve_speed
         self.max_speed_command = self.straight_speed
         self.publisher_conflict_reported = False
 
+        # 시작 시 정지한다. 초록불이면 주행 상태를 유지하고, 이후
+        # 빨간불이 검출될 때만 다시 정지 상태로 전환한다.
+        self.red_pixel_threshold = 50
+        self.green_pixel_threshold = 30
+        self.red_required_frames = 5
+        self.green_required_frames = 3
+        self.red_frame_count = 0
+        self.green_frame_count = 0
+        self.driving_enabled = False
+
         self.yellowx_previous = None
         self.yellow_lookahead_previous = None
 
         self.yellow_miss_count = 0
+
+        # 노란 왼쪽 경계와 흰색 오른쪽 경계 사이의 차로 폭 추정값이다.
+        # 점선이 잠시 끊겨도 최근 폭을 이용해 차로 중앙을 유지한다.
+        self.lane_width_bottom_estimate = 310.0
+        self.lane_width_lookahead_estimate = 220.0
 
         # publisher
         self.motor_pub = self.create_publisher(
@@ -411,6 +427,13 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data
         )
 
+        self.traffic_light_sub = self.create_subscription(
+            Int64MultiArray,
+            '/traffic_light',
+            self.traffic_light_callback,
+            10
+        )
+
         self.get_logger().info(
             "===== Enhanced Lane Driving Start ====="
         )
@@ -424,6 +447,48 @@ class TrackDriverNode(Node):
             data,
             "bgr8"
         )
+
+    def traffic_light_callback(self, message):
+
+        if len(message.data) < 2:
+            self.red_frame_count = 0
+            self.green_frame_count = 0
+            return
+
+        red_visible = message.data[0] >= self.red_pixel_threshold
+        green_visible = message.data[1] >= self.green_pixel_threshold
+
+        # 빨강과 초록이 동시에 검출되면 초록 주행을 우선한다.
+        if green_visible:
+            self.green_frame_count = min(
+                self.green_frame_count + 1,
+                self.green_required_frames
+            )
+            self.red_frame_count = 0
+
+            if (
+                self.green_frame_count >= self.green_required_frames and
+                not self.driving_enabled
+            ):
+                self.driving_enabled = True
+                self.get_logger().info('GREEN detected: driving enabled')
+        elif red_visible:
+            self.red_frame_count = min(
+                self.red_frame_count + 1,
+                self.red_required_frames
+            )
+            self.green_frame_count = 0
+
+            if (
+                self.red_frame_count >= self.red_required_frames and
+                self.driving_enabled
+            ):
+                self.driving_enabled = False
+                self.get_logger().info('RED detected: vehicle stopped')
+        else:
+            # 신호등이 시야에서 사라져도 현재 주행 상태는 유지한다.
+            self.red_frame_count = 0
+            self.green_frame_count = 0
 
     # =========================================
     # drive
@@ -770,87 +835,79 @@ class TrackDriverNode(Node):
         # target center
         # =====================================
         target = 320
-
-        # =====================================
-        # 중앙선 침범 방지 + 실제 차로 중앙 보정
-        # =====================================
         centerline_guard_x = target - 85
         yellow_center_x = None
         yellow_lookahead_x = None
+
+        # 노란 점선이 끊긴 프레임의 기본값: 최근 차로 폭과 오른쪽
+        # 경계로 차로의 실제 중점을 계산한다.
+        bottom_lane_center = (
+            right_lane_x - self.lane_width_bottom_estimate / 2.0
+        )
+        lookahead_lane_center = (
+            right_lane_lookahead -
+            self.lane_width_lookahead_estimate / 2.0
+        )
 
         if yellow_info is not None:
 
             yellow_center_x = yellow_info["bottom_x"]
             yellow_lookahead_x = yellow_info["lookahead_x"]
 
-            lane_width_bottom = (
-                right_lane_x - yellow_center_x
-            )
-
-            if 170 <= lane_width_bottom <= 430:
-
-                boundary_center = int(
-                    (
-                        right_lane_x +
-                        yellow_center_x
-                    ) / 2
-                )
-
-                lane_center = int(
-                    0.55 * lane_center +
-                    0.45 * boundary_center
-                )
-
-            else:
-
-                yellow_based_center = int(
-                    yellow_center_x + 155
-                )
-
-                lane_center = int(
-                    0.70 * lane_center +
-                    0.30 * yellow_based_center
-                )
-
+            lane_width_bottom = right_lane_x - yellow_center_x
             lane_width_lookahead = (
                 right_lane_lookahead - yellow_lookahead_x
             )
 
+            if 170 <= lane_width_bottom <= 430:
+
+                self.lane_width_bottom_estimate = (
+                    0.85 * self.lane_width_bottom_estimate +
+                    0.15 * lane_width_bottom
+                )
+                bottom_lane_center = (
+                    yellow_center_x + right_lane_x
+                ) / 2.0
+
+            else:
+
+                bottom_lane_center = (
+                    yellow_center_x +
+                    self.lane_width_bottom_estimate / 2.0
+                )
+
             if 130 <= lane_width_lookahead <= 390:
 
-                boundary_center_lookahead = int(
-                    (
-                        right_lane_lookahead +
-                        yellow_lookahead_x
-                    ) / 2
+                self.lane_width_lookahead_estimate = (
+                    0.85 * self.lane_width_lookahead_estimate +
+                    0.15 * lane_width_lookahead
+                )
+                lookahead_lane_center = (
+                    yellow_lookahead_x + right_lane_lookahead
+                ) / 2.0
+
+            else:
+
+                lookahead_lane_center = (
+                    yellow_lookahead_x +
+                    self.lane_width_lookahead_estimate / 2.0
                 )
 
-                lane_center = int(
-                    0.82 * lane_center +
-                    0.18 * boundary_center_lookahead
-                )
+        # 가까운 중점을 주로 사용하고 먼 중점으로 커브를 미리 반영한다.
+        lane_center = int(
+            0.70 * bottom_lane_center +
+            0.30 * lookahead_lane_center
+        )
 
-            min_center_from_yellow = (
-                yellow_center_x + 145
-            )
-
-            if lane_center < min_center_from_yellow:
-
-                lane_center = min_center_from_yellow
+        # 노란선이 차량 쪽으로 가까워질 때만 추가로 오른쪽에 여유를 둔다.
+        if yellow_center_x is not None:
 
             centerline_error = max(
                 0,
                 yellow_center_x - centerline_guard_x
             )
 
-            if centerline_error > 0:
-
-                lane_center = int(
-                    min(
-                        white_binary.shape[1] - 1,
-                        lane_center + centerline_error * 1.1
-                    )
-                )
+            lane_center += int(centerline_error * 0.8)
 
         lane_center = int(
             np.clip(
@@ -1035,6 +1092,9 @@ class TrackDriverNode(Node):
                 0.08 * target_speed
             )
             speed = self.current_speed
+
+            if not self.driving_enabled:
+                speed = 0.0
 
             # 둘 이상의 노드가 같은 모터 토픽을 발행하면 명령이 서로
             # 덮어써지므로, 충돌이 해소될 때까지 이 노드는 정지 명령만 보낸다.
