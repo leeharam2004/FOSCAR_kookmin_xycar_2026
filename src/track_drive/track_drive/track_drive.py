@@ -26,6 +26,9 @@ from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
 
+# True로 바꾸면 신호등 없이 즉시 주행 시작 (신호등 콜백 무시)
+IGNORE_TRAFFIC_LIGHT = True
+
 
 # =============================================
 # Sliding Window
@@ -576,7 +579,7 @@ class TrackDriverNode(Node):
         self.green_required_frames = 3
         self.red_frame_count = 0
         self.green_frame_count = 0
-        self.driving_enabled = False
+        self.driving_enabled = IGNORE_TRAFFIC_LIGHT
 
         self.yellowx_previous = None
         self.yellow_lookahead_previous = None
@@ -633,6 +636,9 @@ class TrackDriverNode(Node):
         )
 
     def traffic_light_callback(self, message):
+
+        if IGNORE_TRAFFIC_LIGHT:
+            return
 
         if len(message.data) < 2:
             self.red_frame_count = 0
@@ -1186,7 +1192,7 @@ class TrackDriverNode(Node):
         # =====================================
         kp = 1.08
 
-        kd = 0.32
+        kd = 0.62
 
         ki = 0.0005
 
@@ -1220,8 +1226,8 @@ class TrackDriverNode(Node):
         # steering limit
         # =====================================
         angle = max(
-            min(angle, 90),
-            -90
+            min(angle, 100),
+            -100
         )
 
         angle *= -1
@@ -1230,7 +1236,7 @@ class TrackDriverNode(Node):
         # 곡률이 클수록 왼쪽 조향만 최대 40% 증폭한다.
         if angle < 0.0:
             left_curve_gain = 1.0 + 0.40 * curve_strength
-            angle = max(angle * left_curve_gain, -90.0)
+            angle = max(angle * left_curve_gain, -100.0)
 
         # 미검출 중에는 오른쪽 최대 조향을 유지한다. 첫 재검출
         # 프레임은 직진하고, 두 번째 연속 검출부터 PID로 즉시 복귀한다.
