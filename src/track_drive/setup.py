@@ -29,6 +29,7 @@ setup(
             'track_drive = track_drive.track_drive:main',
             'traffic_light = track_drive.traffic_Light:main',
             'pedestrian_detector = track_drive.pedestrian_detector:main',
+            'track_drive_2 = track_drive.track_drive_2:main',
         ],
     },
 )
