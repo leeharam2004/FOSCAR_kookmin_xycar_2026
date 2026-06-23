@@ -18,7 +18,7 @@ from xycar_msgs.msg import XycarMotor
 #   1 — sliding_window 창만 (지금은 birds_eye_binary로 대체)
 #   2 — 모든 창 표시
 # =============================================
-DEBUG_LEVEL = 1
+DEBUG_LEVEL = 2
 
 # =============================================
 # 파라미터 (튜닝 필요)
@@ -75,6 +75,15 @@ KFF = 0.0   # 커브 feedforward 게인
 SPEED_MAX   = 15.0  # 직선 최대 속도
 SPEED_MIN   = 3.0  # 커브 최소 속도
 SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
+
+# =============================================
+# 어린이 보호구역 감지 파라미터 (튜닝 필요)
+# =============================================
+SCHOOL_ZONE_ENTER_FRAMES  = 5     # 연속 N프레임 yellow dominant → 진입
+SCHOOL_ZONE_EXIT_FRAMES   = 15    # 연속 M프레임 not dominant → 탈출 (hysteresis)
+SCHOOL_ZONE_YELLOW_RATIO  = 2.0   # yellow_px > white_px * ratio → dominant 판정
+CENTER_MASK_X_START       = 220   # BEV 중앙 점선 마스크 시작 x (px, 튜닝)
+CENTER_MASK_X_END         = 420   # BEV 중앙 점선 마스크 끝 x (px, 튜닝)
 
 # =============================================
 # 정지선 검출 파라미터 (BEV warped_white 기준)
@@ -267,6 +276,41 @@ class StopLineDetector:
             'debug_img': debug_img,
             'candidates': candidates,
         }
+
+
+# =============================================
+# SchoolZoneDetector
+# warped_white / warped_yellow 비교 → 어린이 보호구역 감지 + debounce
+# run() 반환: SlideWindow에 넘길 lane_img (white or 마스킹된 yellow)
+# =============================================
+class SchoolZoneDetector:
+
+    def __init__(self):
+        self.school_zone_mode = False
+        self._frames = 0  # 양수: 진입 방향, 음수: 탈출 방향
+
+    def run(self, warped_white, warped_yellow):
+        yellow_px = int(np.count_nonzero(warped_yellow))
+        white_px  = int(np.count_nonzero(warped_white))
+
+        is_yellow_dominant = yellow_px > max(white_px, 1) * SCHOOL_ZONE_YELLOW_RATIO
+
+        if is_yellow_dominant:
+            self._frames = min(self._frames + 1, SCHOOL_ZONE_ENTER_FRAMES)
+        else:
+            self._frames = max(self._frames - 1, -SCHOOL_ZONE_EXIT_FRAMES)
+
+        if self._frames >= SCHOOL_ZONE_ENTER_FRAMES:
+            self.school_zone_mode = True
+        elif self._frames <= -SCHOOL_ZONE_EXIT_FRAMES:
+            self.school_zone_mode = False
+
+        if not self.school_zone_mode:
+            return warped_white
+
+        lane_img = warped_yellow.copy()
+        lane_img[:, CENTER_MASK_X_START:CENTER_MASK_X_END] = 0
+        return lane_img
 
 
 # =============================================
@@ -633,6 +677,7 @@ class MainLoop(Node):
         self.bridge        = CvBridge()
         self.image         = None
         self.preprocessing = Preprocessing()
+        self.school_zone   = SchoolZoneDetector()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
 
@@ -667,7 +712,11 @@ class MainLoop(Node):
 
         if DEBUG_LEVEL >= 1:
             if sw['debug_img'] is not None:
-                cv2.imshow('sliding_window', sw['debug_img'])
+                dbg = sw['debug_img'].copy()
+                if self.school_zone.school_zone_mode:
+                    cv2.putText(dbg, 'SCHOOL ZONE', (10, dbg.shape[0] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.imshow('sliding_window', dbg)
             else:
                 cv2.imshow('sliding_window', prep['warped_white'])
             cv2.imshow('stop_line', stop_line['debug_img'])
@@ -692,8 +741,9 @@ class MainLoop(Node):
 
             roi = self.image[ROI_Y_START:ROI_Y_END, :].copy()
 
-            prep = self.preprocessing.run(roi)
-            sw   = self.slidewindow.run(prep['warped_white'])
+            prep     = self.preprocessing.run(roi)
+            lane_img = self.school_zone.run(prep['warped_white'], prep['warped_yellow'])
+            sw       = self.slidewindow.run(lane_img)
             stop_line = self.stop_line_detector.run(prep['warped_white'])
 
             stop_line_message = Bool()
