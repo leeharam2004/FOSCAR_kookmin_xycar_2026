@@ -632,6 +632,8 @@ class MainLoop(Node):
 
         self.bridge        = CvBridge()
         self.image         = None
+        self.new_image     = False
+        self.stop_line_result = None
         self.preprocessing = Preprocessing()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
@@ -653,6 +655,7 @@ class MainLoop(Node):
     # -----------------------------------------
     def _cam_callback(self, data):
         self.image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+        self.new_image = True
 
     # -----------------------------------------
     # debug 창 표시
@@ -690,15 +693,25 @@ class MainLoop(Node):
             if self.image is None:
                 continue
 
+            # 차선 PID는 기존과 같은 루프 주기로 실행한다. 새 프레임만
+            # 처리하도록 제한하면 큰 KD가 프레임 간 노이즈에 반응해 조향이
+            # 흔들리므로, 정지선 확인 횟수만 실제 카메라 프레임에 맞춘다.
+            is_new_image = self.new_image
+            self.new_image = False
             roi = self.image[ROI_Y_START:ROI_Y_END, :].copy()
 
             prep = self.preprocessing.run(roi)
             sw   = self.slidewindow.run(prep['warped_white'])
-            stop_line = self.stop_line_detector.run(prep['warped_white'])
-
-            stop_line_message = Bool()
-            stop_line_message.data = bool(stop_line['detected'])
-            self.pub_stop_line.publish(stop_line_message)
+            if is_new_image or self.stop_line_result is None:
+                self.stop_line_result = self.stop_line_detector.run(
+                    prep['warped_white']
+                )
+                stop_line_message = Bool()
+                stop_line_message.data = bool(
+                    self.stop_line_result['detected']
+                )
+                self.pub_stop_line.publish(stop_line_message)
+            stop_line = self.stop_line_result
 
             t_angle = (abs(sw['angle']) / 100.0) ** 0.8
             t_kd    = min(1.0, abs(SPEED_KD * sw['d_error']) / 100.0)

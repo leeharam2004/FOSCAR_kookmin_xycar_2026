@@ -21,7 +21,6 @@ def generate_launch_description():
             parameters=[{
                 'red_pixel_threshold': 50,
                 'green_pixel_threshold': 50,
-                'arrow_pixel_threshold': 15,
                 'confirmation_frames': 3,
                 'left_turn_angle': -100.0,
                 'left_turn_speed': 3.0,
