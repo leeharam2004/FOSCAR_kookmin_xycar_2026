@@ -8,7 +8,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int64MultiArray
+from std_msgs.msg import Bool, Int64MultiArray
 from xycar_msgs.msg import XycarMotor
 
 from track_drive.track_drive import (
@@ -23,6 +23,7 @@ class TrafficDetection(Node):
     """Detect red and green circular traffic lights from the front camera."""
 
     STATE_DRIVE = 'DRIVE'
+    STATE_RED_APPROACH = 'RED_APPROACH'
     STATE_STOP = 'STOP'
     STATE_LEFT_TURN = 'LEFT_TURN'
 
@@ -79,6 +80,7 @@ class TrafficDetection(Node):
         self.lane_was_lost_during_turn = False
         self.lane_reacquisition_frames = 0
         self.left_turn_frame_count = 0
+        self.stop_line_detected = False
 
         # track_drive.py는 수정하지 않고 같은 검출기를 별도 상태로 사용한다.
         # 좌회전 중에만 실행하므로 평상시에는 중복 영상 처리 비용이 없다.
@@ -112,6 +114,12 @@ class TrafficDetection(Node):
             self.motor_callback,
             10,
         )
+        self.stop_line_subscription = self.create_subscription(
+            Bool,
+            '/stop_line',
+            self.stop_line_callback,
+            10,
+        )
         self.motor_pub = self.create_publisher(
             XycarMotor,
             '/xycar_motor',
@@ -120,6 +128,14 @@ class TrafficDetection(Node):
 
         self._create_debug_windows()
         self.get_logger().info('ROS2 traffic-light detector started')
+
+    def stop_line_callback(self, message):
+        self.stop_line_detected = bool(message.data)
+        if (
+            self.driving_state == self.STATE_RED_APPROACH
+            and self.stop_line_detected
+        ):
+            self._set_driving_state(self.STATE_STOP)
 
     def motor_callback(self, lane_command):
         """Apply the traffic-light state to the lane-driving command."""
@@ -156,7 +172,10 @@ class TrafficDetection(Node):
         if red_detected and (green_detected or arrow_detected):
             candidate_state = self.STATE_LEFT_TURN
         elif red_detected:
-            candidate_state = self.STATE_STOP
+            if self.driving_state == self.STATE_STOP:
+                candidate_state = self.STATE_STOP
+            else:
+                candidate_state = self.STATE_RED_APPROACH
         elif green_detected:
             candidate_state = self.STATE_DRIVE
         else:
@@ -192,8 +211,15 @@ class TrafficDetection(Node):
                 self.get_logger().info(
                     'Left arrow confirmed: maximum-left turn started'
                 )
+        elif state == self.STATE_RED_APPROACH:
+            if emit_log:
+                self.get_logger().info(
+                    'Red light confirmed: approaching stop line'
+                )
+            if self.stop_line_detected:
+                self._set_driving_state(self.STATE_STOP, emit_log=emit_log)
         elif state == self.STATE_STOP and emit_log:
-            self.get_logger().info('Red light confirmed: vehicle stopped')
+            self.get_logger().info('Stop line confirmed: vehicle stopped')
         elif state == self.STATE_DRIVE and emit_log:
             self.get_logger().info('Lane driving resumed')
 
@@ -507,6 +533,8 @@ class TrafficDetection(Node):
             state_color = (0, 255, 0)
         elif self.driving_state == self.STATE_LEFT_TURN:
             state_color = (0, 255, 255)
+        elif self.driving_state == self.STATE_RED_APPROACH:
+            state_color = (0, 165, 255)
         else:
             state_color = (0, 0, 255)
         cv2.putText(

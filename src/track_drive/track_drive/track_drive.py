@@ -9,6 +9,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
+from std_msgs.msg import Bool
 from xycar_msgs.msg import XycarMotor
 
 # =============================================
@@ -74,6 +75,16 @@ KFF = 0.0   # 커브 feedforward 게인
 SPEED_MAX   = 15.0  # 직선 최대 속도
 SPEED_MIN   = 3.0  # 커브 최소 속도
 SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
+
+# =============================================
+# 정지선 검출 파라미터 (BEV warped_white 기준)
+# =============================================
+STOP_LINE_Y_START        = 190
+STOP_LINE_Y_END          = 300
+STOP_LINE_X_MARGIN       = 70
+STOP_LINE_MIN_WIDTH      = 260
+STOP_LINE_MIN_HEIGHT     = 3
+STOP_LINE_CONFIRM_FRAMES = 3
 
 
 # =============================================
@@ -174,6 +185,88 @@ class Preprocessing:
             cv2.putText(overlay, str(i), (x + 8, y - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         return overlay
+
+
+# =============================================
+# StopLineDetector
+# BEV 흰색 영상에서 차량 가까이에 있는 긴 가로선을 검출한다.
+# =============================================
+class StopLineDetector:
+
+    def __init__(self):
+        self.detection_frames = 0
+        self.horizontal_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (41, 3),
+        )
+
+    def run(self, warped_white):
+        height, width = warped_white.shape[:2]
+        y_start = int(np.clip(STOP_LINE_Y_START, 0, height - 1))
+        y_end = int(np.clip(STOP_LINE_Y_END, y_start + 1, height))
+        x_start = int(np.clip(STOP_LINE_X_MARGIN, 0, width - 1))
+        x_end = int(np.clip(width - STOP_LINE_X_MARGIN, x_start + 1, width))
+
+        search = warped_white[y_start:y_end, x_start:x_end]
+        horizontal = cv2.morphologyEx(
+            search,
+            cv2.MORPH_OPEN,
+            self.horizontal_kernel,
+        )
+        contours, _ = cv2.findContours(
+            horizontal,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        candidates = []
+        for contour in contours:
+            x, y, candidate_width, candidate_height = cv2.boundingRect(contour)
+            if (
+                candidate_width >= STOP_LINE_MIN_WIDTH
+                and candidate_height >= STOP_LINE_MIN_HEIGHT
+            ):
+                candidates.append(
+                    (x + x_start, y + y_start, candidate_width, candidate_height)
+                )
+
+        if candidates:
+            self.detection_frames += 1
+        else:
+            self.detection_frames = 0
+
+        detected = self.detection_frames >= STOP_LINE_CONFIRM_FRAMES
+        debug_img = cv2.cvtColor(warped_white, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(
+            debug_img,
+            (x_start, y_start),
+            (x_end - 1, y_end - 1),
+            (255, 255, 0),
+            2,
+        )
+        for x, y, candidate_width, candidate_height in candidates:
+            cv2.rectangle(
+                debug_img,
+                (x, y),
+                (x + candidate_width, y + candidate_height),
+                (0, 0, 255) if detected else (0, 255, 255),
+                3,
+            )
+        cv2.putText(
+            debug_img,
+            f'stop line: {"DETECTED" if detected else "SEARCHING"}',
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255) if detected else (0, 255, 0),
+            2,
+        )
+
+        return {
+            'detected': detected,
+            'debug_img': debug_img,
+            'candidates': candidates,
+        }
 
 
 # =============================================
@@ -541,6 +634,7 @@ class MainLoop(Node):
         self.image         = None
         self.preprocessing = Preprocessing()
         self.slidewindow   = SlideWindow()
+        self.stop_line_detector = StopLineDetector()
 
         self.sub_cam = self.create_subscription(
             Image,
@@ -550,6 +644,7 @@ class MainLoop(Node):
         )
 
         self.pub_motor = self.create_publisher(XycarMotor, '/xycar_motor', 10)
+        self.pub_stop_line = self.create_publisher(Bool, '/stop_line', 10)
 
         self.get_logger().info('track_drive_2 started')
 
@@ -565,7 +660,7 @@ class MainLoop(Node):
     # DEBUG_LEVEL 1: sliding_window만 (미구현 시 birds_eye_binary 대체)
     # DEBUG_LEVEL 2: 전체
     # -----------------------------------------
-    def _show_debug(self, prep, sw):
+    def _show_debug(self, prep, sw, stop_line):
 
         if DEBUG_LEVEL == 0:
             return
@@ -575,6 +670,7 @@ class MainLoop(Node):
                 cv2.imshow('sliding_window', sw['debug_img'])
             else:
                 cv2.imshow('sliding_window', prep['warped_white'])
+            cv2.imshow('stop_line', stop_line['debug_img'])
 
         if DEBUG_LEVEL >= 2:
             cv2.imshow('original_roi',    prep['annotated_roi'])
@@ -598,6 +694,11 @@ class MainLoop(Node):
 
             prep = self.preprocessing.run(roi)
             sw   = self.slidewindow.run(prep['warped_white'])
+            stop_line = self.stop_line_detector.run(prep['warped_white'])
+
+            stop_line_message = Bool()
+            stop_line_message.data = bool(stop_line['detected'])
+            self.pub_stop_line.publish(stop_line_message)
 
             t_angle = (abs(sw['angle']) / 100.0) ** 0.8
             t_kd    = min(1.0, abs(SPEED_KD * sw['d_error']) / 100.0)
@@ -611,7 +712,7 @@ class MainLoop(Node):
             msg.speed = float(speed)
             self.pub_motor.publish(msg)
 
-            self._show_debug(prep, sw)
+            self._show_debug(prep, sw, stop_line)
 
             if cv2.waitKey(1) & 0xFF == 27:
                 break
