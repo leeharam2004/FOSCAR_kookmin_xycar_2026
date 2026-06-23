@@ -510,7 +510,7 @@ class TrafficDetection(Node):
             cv2.imshow('red_mask', red_mask)
             cv2.imshow('green_mask', green_mask)
             cv2.imshow('red_result', red_result)
-
+            
 
 def main(args=None):
     rclpy.init(args=args)
