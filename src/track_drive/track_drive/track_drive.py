@@ -18,7 +18,7 @@ from xycar_msgs.msg import XycarMotor
 #   1 — sliding_window 창만 (지금은 birds_eye_binary로 대체)
 #   2 — 모든 창 표시
 # =============================================
-DEBUG_LEVEL = 2
+DEBUG_LEVEL = 1
 
 # =============================================
 # 파라미터 (튜닝 필요)
