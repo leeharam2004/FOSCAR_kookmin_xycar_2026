@@ -9,7 +9,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import Bool, Int64MultiArray
+from std_msgs.msg import Bool
 from xycar_msgs.msg import XycarMotor
 
 # =============================================
@@ -79,17 +79,17 @@ SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
 # =============================================
 # 어린이 보호구역 감지 파라미터 (튜닝 필요)
 # =============================================
-SCHOOL_ZONE_ENTER_FRAMES = 5
-SCHOOL_ZONE_EXIT_FRAMES = 15
-SCHOOL_ZONE_YELLOW_RATIO = 2.0
-CENTER_MASK_X_START = 220
-CENTER_MASK_X_END = 420
+SCHOOL_ZONE_ENTER_FRAMES  = 5     # 연속 N프레임 yellow dominant → 진입
+SCHOOL_ZONE_EXIT_FRAMES   = 15    # 연속 M프레임 not dominant → 탈출 (hysteresis)
+SCHOOL_ZONE_YELLOW_RATIO  = 2.0   # yellow_px > white_px * ratio → dominant 판정
+CENTER_MASK_X_START       = 220   # BEV 중앙 점선 마스크 시작 x (px, 튜닝)
+CENTER_MASK_X_END         = 420   # BEV 중앙 점선 마스크 끝 x (px, 튜닝)
 
 # =============================================
 # 정지선 검출 파라미터 (BEV warped_white 기준)
 # =============================================
-STOP_LINE_Y_START        = 170
-STOP_LINE_Y_END          = 280
+STOP_LINE_Y_START        = 190
+STOP_LINE_Y_END          = 300
 STOP_LINE_X_MARGIN       = 70
 STOP_LINE_MIN_WIDTH      = 260
 STOP_LINE_MIN_HEIGHT     = 3
@@ -280,34 +280,25 @@ class StopLineDetector:
 
 # =============================================
 # SchoolZoneDetector
-# 흰색보다 노란색 차선이 우세하면 노란 양쪽 실선을 추종한다.
-# 중앙 노란 점선은 차선으로 오인하지 않도록 제거한다.
+# warped_white / warped_yellow 비교 → 어린이 보호구역 감지 + debounce
+# run() 반환: SlideWindow에 넘길 lane_img (white or 마스킹된 yellow)
 # =============================================
 class SchoolZoneDetector:
 
     def __init__(self):
         self.school_zone_mode = False
-        self._frames = 0
+        self._frames = 0  # 양수: 진입 방향, 음수: 탈출 방향
 
     def run(self, warped_white, warped_yellow):
         yellow_px = int(np.count_nonzero(warped_yellow))
-        white_px = int(np.count_nonzero(warped_white))
-        is_yellow_dominant = (
-            yellow_px > max(white_px, 1) * SCHOOL_ZONE_YELLOW_RATIO
-        )
+        white_px  = int(np.count_nonzero(warped_white))
+
+        is_yellow_dominant = yellow_px > max(white_px, 1) * SCHOOL_ZONE_YELLOW_RATIO
 
         if is_yellow_dominant:
-            self._frames = max(self._frames, 0)
-            self._frames = min(
-                self._frames + 1,
-                SCHOOL_ZONE_ENTER_FRAMES,
-            )
+            self._frames = min(self._frames + 1, SCHOOL_ZONE_ENTER_FRAMES)
         else:
-            self._frames = min(self._frames, 0)
-            self._frames = max(
-                self._frames - 1,
-                -SCHOOL_ZONE_EXIT_FRAMES,
-            )
+            self._frames = max(self._frames - 1, -SCHOOL_ZONE_EXIT_FRAMES)
 
         if self._frames >= SCHOOL_ZONE_ENTER_FRAMES:
             self.school_zone_mode = True
@@ -317,9 +308,9 @@ class SchoolZoneDetector:
         if not self.school_zone_mode:
             return warped_white
 
-        lane_image = warped_yellow.copy()
-        lane_image[:, CENTER_MASK_X_START:CENTER_MASK_X_END] = 0
-        return lane_image
+        lane_img = warped_yellow.copy()
+        lane_img[:, CENTER_MASK_X_START:CENTER_MASK_X_END] = 0
+        return lane_img
 
 
 # =============================================
@@ -685,11 +676,8 @@ class MainLoop(Node):
 
         self.bridge        = CvBridge()
         self.image         = None
-        self.new_image     = False
-        self.stop_line_result = None
-        self.lane_image = None
         self.preprocessing = Preprocessing()
-        self.school_zone = SchoolZoneDetector()
+        self.school_zone   = SchoolZoneDetector()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
 
@@ -702,11 +690,6 @@ class MainLoop(Node):
 
         self.pub_motor = self.create_publisher(XycarMotor, '/xycar_motor', 10)
         self.pub_stop_line = self.create_publisher(Bool, '/stop_line', 10)
-        self.pub_lane_detection = self.create_publisher(
-            Int64MultiArray,
-            '/lane_detection_status',
-            10,
-        )
 
         self.get_logger().info('track_drive_2 started')
 
@@ -715,7 +698,6 @@ class MainLoop(Node):
     # -----------------------------------------
     def _cam_callback(self, data):
         self.image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-        self.new_image = True
 
     # -----------------------------------------
     # debug 창 표시
@@ -730,18 +712,11 @@ class MainLoop(Node):
 
         if DEBUG_LEVEL >= 1:
             if sw['debug_img'] is not None:
-                debug_image = sw['debug_img'].copy()
+                dbg = sw['debug_img'].copy()
                 if self.school_zone.school_zone_mode:
-                    cv2.putText(
-                        debug_image,
-                        'SCHOOL ZONE',
-                        (10, debug_image.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 255),
-                        2,
-                    )
-                cv2.imshow('sliding_window', debug_image)
+                    cv2.putText(dbg, 'SCHOOL ZONE', (10, dbg.shape[0] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.imshow('sliding_window', dbg)
             else:
                 cv2.imshow('sliding_window', prep['warped_white'])
             cv2.imshow('stop_line', stop_line['debug_img'])
@@ -764,39 +739,16 @@ class MainLoop(Node):
             if self.image is None:
                 continue
 
-            # 차선 PID는 기존과 같은 루프 주기로 실행한다. 새 프레임만
-            # 처리하도록 제한하면 큰 KD가 프레임 간 노이즈에 반응해 조향이
-            # 흔들리므로, 정지선 확인 횟수만 실제 카메라 프레임에 맞춘다.
-            is_new_image = self.new_image
-            self.new_image = False
             roi = self.image[ROI_Y_START:ROI_Y_END, :].copy()
 
-            prep = self.preprocessing.run(roi)
-            # 같은 카메라 프레임을 반복 처리해 debounce가 즉시 끝나지
-            # 않도록 보호구역 판정은 새 영상마다 한 번만 갱신한다.
-            if is_new_image or self.lane_image is None:
-                self.lane_image = self.school_zone.run(
-                    prep['warped_white'],
-                    prep['warped_yellow'],
-                )
-            sw = self.slidewindow.run(self.lane_image)
-            if is_new_image or self.stop_line_result is None:
-                lane_detection_message = Int64MultiArray()
-                lane_detection_message.data = [
-                    int(sw['left_detected']),
-                    int(sw['right_detected']),
-                ]
-                self.pub_lane_detection.publish(lane_detection_message)
+            prep     = self.preprocessing.run(roi)
+            lane_img = self.school_zone.run(prep['warped_white'], prep['warped_yellow'])
+            sw       = self.slidewindow.run(lane_img)
+            stop_line = self.stop_line_detector.run(prep['warped_white'])
 
-                self.stop_line_result = self.stop_line_detector.run(
-                    prep['warped_white']
-                )
-                stop_line_message = Bool()
-                stop_line_message.data = bool(
-                    self.stop_line_result['detected']
-                )
-                self.pub_stop_line.publish(stop_line_message)
-            stop_line = self.stop_line_result
+            stop_line_message = Bool()
+            stop_line_message.data = bool(stop_line['detected'])
+            self.pub_stop_line.publish(stop_line_message)
 
             t_angle = (abs(sw['angle']) / 100.0) ** 0.8
             t_kd    = min(1.0, abs(SPEED_KD * sw['d_error']) / 100.0)
@@ -826,9 +778,26 @@ class MainLoop(Node):
 # =============================================
 # main
 # =============================================
+def _wait_for_nav2_completion():
+    """motor_translator가 살아있다가 죽을 때까지 대기."""
+    wait_node = rclpy.create_node('track_drive_waiter')
+    nav2_active = False
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(wait_node, timeout_sec=0.5)
+            count = wait_node.count_publishers('/xycar_motor')
+            if count >= 1:
+                nav2_active = True
+            if nav2_active and count == 0:
+                break
+    finally:
+        wait_node.destroy_node()
+
+
 def main(args=None):
 
     rclpy.init(args=args)
+    _wait_for_nav2_completion()
     node = MainLoop()
 
     try:
