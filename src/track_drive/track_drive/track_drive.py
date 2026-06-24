@@ -700,7 +700,7 @@ class MainLoop(Node):
             qos_profile_sensor_data
         )
 
-        self.pub_motor = self.create_publisher(XycarMotor, '/xycar_motor', 10)
+        self.pub_motor = self.create_publisher(XycarMotor, '/lane_motor_cmd', 10)
         self.pub_stop_line = self.create_publisher(Bool, '/stop_line', 10)
         self.pub_lane_detection = self.create_publisher(
             Int64MultiArray,

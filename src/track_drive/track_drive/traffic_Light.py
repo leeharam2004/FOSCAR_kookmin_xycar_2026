@@ -643,8 +643,25 @@ class TrafficDetection(Node):
             cv2.imshow('red_result', red_result)
             
 
+def _wait_for_nav2_completion():
+    """motor_translator가 /xycar_motor에 퍼블리시하다가 죽을 때까지 대기."""
+    wait_node = rclpy.create_node('traffic_light_waiter')
+    nav2_active = False
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(wait_node, timeout_sec=0.5)
+            count = wait_node.count_publishers('/xycar_motor')
+            if count >= 1:
+                nav2_active = True
+            if nav2_active and count == 0:
+                break
+    finally:
+        wait_node.destroy_node()
+
+
 def main(args=None):
     rclpy.init(args=args)
+    _wait_for_nav2_completion()
     node = TrafficDetection()
 
     try:
