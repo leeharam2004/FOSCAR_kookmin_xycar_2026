@@ -25,12 +25,12 @@ class TrafficDetection(Node):
 
     # 신호등은 영상 상단에 있고 라바콘은 주로 노면 쪽에 나타난다.
     TRAFFIC_ROI_TOP_RATIO = 0.0
-    TRAFFIC_ROI_BOTTOM_RATIO = 0.55
+    TRAFFIC_ROI_BOTTOM_RATIO = 0.45
 
     # 좌측에서 교차로로 진입하는 경찰차의 경광등 검출 영역이다.
     POLICE_ROI_X_START_RATIO = 0.0
     POLICE_ROI_X_END_RATIO = 0.75
-    POLICE_ROI_Y_START_RATIO = 0.42
+    POLICE_ROI_Y_START_RATIO = 0.48
     POLICE_ROI_Y_END_RATIO = 0.92
 
     def __init__(self):
@@ -121,6 +121,10 @@ class TrafficDetection(Node):
         self.police_car_detected = False
         self.police_detection_frames = 0
         self.police_clear_frame_count = 0
+        self.police_left_turn_blocked = False
+        self.police_left_signal_frames = 0
+        self.police_red_signal_frames = 0
+        self.police_green_signal_frames = 0
         self.stop_line_detected = False
         self.left_lane_detected = False
         self.right_lane_detected = False
@@ -241,6 +245,13 @@ class TrafficDetection(Node):
             self.pending_signal_frames = 0
             return
 
+        if self.police_left_turn_blocked:
+            self._update_signal_after_police_block(
+                red_detected,
+                green_detected,
+            )
+            return
+
         if red_detected and green_detected:
             candidate_state = self.STATE_LEFT_TURN
         elif red_detected:
@@ -250,13 +261,28 @@ class TrafficDetection(Node):
         else:
             candidate_state = None
 
-        # 경찰차가 좌회전 충돌 구역에 있으면 신호 좌회전을 시작하지
-        # 않는다. 차량이 사라지면 현재 신호를 다시 확인해 출발한다.
+        # 경찰차가 있는 좌회전 신호는 실행하지 않고 다음 신호 주기를
+        # 기다린다. 신호 누락 한 프레임으로 진입하지 않도록 debounce한다.
         if (
             candidate_state == self.STATE_LEFT_TURN
             and self.police_car_detected
         ):
-            candidate_state = self.STATE_STOP
+            self.police_left_signal_frames += 1
+            self.pending_signal_state = None
+            self.pending_signal_frames = 0
+            if self.police_left_signal_frames >= self.confirmation_frames:
+                self.police_left_turn_blocked = True
+                self.police_red_signal_frames = 0
+                self.police_green_signal_frames = 0
+                if self.driving_state != self.STATE_STOP:
+                    self._set_driving_state(self.STATE_STOP, emit_log=False)
+                self.get_logger().warning(
+                    'Police car present: left-turn signal skipped, waiting for '
+                    'the next signal'
+                )
+            return
+
+        self.police_left_signal_frames = 0
 
         if candidate_state is None:
             self.pending_signal_state = None
@@ -275,6 +301,45 @@ class TrafficDetection(Node):
 
         if candidate_state != self.driving_state:
             self._set_driving_state(candidate_state)
+
+    def _update_signal_after_police_block(
+        self,
+        red_detected,
+        green_detected,
+    ):
+        """Follow the next stable signal after skipping a left turn."""
+        self.pending_signal_state = None
+        self.pending_signal_frames = 0
+
+        if red_detected and not green_detected:
+            self.police_red_signal_frames += 1
+            self.police_green_signal_frames = 0
+            if self.police_red_signal_frames == self.confirmation_frames:
+                self.get_logger().info(
+                    'Red confirmed after blocked left turn: staying stopped'
+                )
+            self.police_red_signal_frames = min(
+                self.police_red_signal_frames,
+                self.confirmation_frames,
+            )
+        elif green_detected and not red_detected:
+            self.police_red_signal_frames = 0
+            self.police_green_signal_frames += 1
+            if self.police_green_signal_frames >= self.confirmation_frames:
+                self.police_left_turn_blocked = False
+                self.police_left_signal_frames = 0
+                self.police_green_signal_frames = 0
+                self.get_logger().info(
+                    'Green confirmed after police block: driving resumed'
+                )
+                self._set_driving_state(self.STATE_DRIVE, emit_log=False)
+                return
+        else:
+            self.police_red_signal_frames = 0
+            self.police_green_signal_frames = 0
+
+        if self.driving_state != self.STATE_STOP:
+            self._set_driving_state(self.STATE_STOP, emit_log=False)
 
     def _start_left_turn_if_signal_timed_out(self):
         """Start a left turn when no signal is visible after stopping."""
