@@ -11,13 +11,6 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Int64MultiArray
 from xycar_msgs.msg import XycarMotor
 
-from track_drive.track_drive import (
-    ROI_Y_END,
-    ROI_Y_START,
-    Preprocessing,
-    SlideWindow,
-)
-
 # 0: 창 없음, 1: 핵심 창만, 2: HSV 트랙바와 모든 마스크
 TRAFFIC_DEBUG_LEVEL = 1
 
@@ -46,6 +39,9 @@ class TrafficDetection(Node):
         self.declare_parameter('confirmation_frames', 3)
         self.declare_parameter('left_turn_angle', -100.0)
         self.declare_parameter('left_turn_speed', 3.0)
+        self.declare_parameter('signal_left_turn_approach_sec', 1.5)
+        self.declare_parameter('signal_wait_timeout_sec', 3.0)
+        self.declare_parameter('no_signal_left_turn_hold_sec', 7.0)
         self.declare_parameter('lane_reacquire_frames', 3)
         self.declare_parameter('left_turn_timeout_frames', 150)
         self.red_pixel_threshold = int(
@@ -64,6 +60,18 @@ class TrafficDetection(Node):
         self.left_turn_speed = float(
             self.get_parameter('left_turn_speed').value
         )
+        self.signal_left_turn_approach_sec = max(
+            0.0,
+            float(self.get_parameter('signal_left_turn_approach_sec').value),
+        )
+        self.signal_wait_timeout_sec = max(
+            0.0,
+            float(self.get_parameter('signal_wait_timeout_sec').value),
+        )
+        self.no_signal_left_turn_hold_sec = max(
+            0.0,
+            float(self.get_parameter('no_signal_left_turn_hold_sec').value),
+        )
         self.lane_reacquire_frames = max(
             1,
             int(self.get_parameter('lane_reacquire_frames').value),
@@ -77,14 +85,17 @@ class TrafficDetection(Node):
         self.pending_signal_state = None
         self.pending_signal_frames = 0
         self.lane_was_lost_during_turn = False
+        self.require_lane_loss_before_reacquire = True
         self.lane_reacquisition_frames = 0
         self.left_turn_frame_count = 0
+        self.left_turn_timeout_enabled = True
+        self.no_signal_left_turn = False
+        self.no_signal_lane_hold_started_at = None
+        self.signal_left_turn_approach_started_at = None
         self.stop_line_detected = False
-
-        # track_drive.py는 수정하지 않고 같은 검출기를 별도 상태로 사용한다.
-        # 좌회전 중에만 실행하므로 평상시에는 중복 영상 처리 비용이 없다.
-        self.lane_preprocessing = Preprocessing()
-        self.lane_detector = SlideWindow()
+        self.left_lane_detected = False
+        self.right_lane_detected = False
+        self.signal_wait_started_at = None
 
         self.camera_subscription = self.create_subscription(
             Image,
@@ -119,6 +130,12 @@ class TrafficDetection(Node):
             self.stop_line_callback,
             10,
         )
+        self.lane_detection_subscription = self.create_subscription(
+            Int64MultiArray,
+            '/lane_detection_status',
+            self.lane_detection_callback,
+            10,
+        )
         self.motor_pub = self.create_publisher(
             XycarMotor,
             '/xycar_motor',
@@ -142,15 +159,27 @@ class TrafficDetection(Node):
         ):
             self._set_driving_state(self.STATE_SIGNAL_WAIT)
 
+    def lane_detection_callback(self, message):
+        if len(message.data) < 2:
+            return
+
+        self.left_lane_detected = bool(message.data[0])
+        self.right_lane_detected = bool(message.data[1])
+        self.update_lane_reacquisition()
+
     def motor_callback(self, lane_command):
         """Apply the traffic-light state to the lane-driving command."""
+        self._finish_no_signal_left_turn_hold_if_elapsed()
         output_command = XycarMotor()
 
         if self.driving_state in (self.STATE_STOP, self.STATE_SIGNAL_WAIT):
             output_command.angle = float(lane_command.angle)
             output_command.speed = 0.0
         elif self.driving_state == self.STATE_LEFT_TURN:
-            output_command.angle = self.left_turn_angle
+            if self._signal_left_turn_approach_is_active():
+                output_command.angle = 0.0
+            else:
+                output_command.angle = self.left_turn_angle
             output_command.speed = self.left_turn_speed
         else:
             output_command.angle = float(lane_command.angle)
@@ -190,6 +219,7 @@ class TrafficDetection(Node):
         if candidate_state is None:
             self.pending_signal_state = None
             self.pending_signal_frames = 0
+            self._start_left_turn_if_signal_timed_out()
             return
 
         if candidate_state == self.pending_signal_state:
@@ -204,18 +234,94 @@ class TrafficDetection(Node):
         if candidate_state != self.driving_state:
             self._set_driving_state(candidate_state)
 
+    def _start_left_turn_if_signal_timed_out(self):
+        """Start a left turn when no signal is visible after stopping."""
+        if (
+            self.driving_state != self.STATE_SIGNAL_WAIT
+            or self.signal_wait_started_at is None
+        ):
+            return
+
+        elapsed_sec = (
+            self.get_clock().now() - self.signal_wait_started_at
+        ).nanoseconds / 1e9
+        if elapsed_sec >= self.signal_wait_timeout_sec:
+            self.get_logger().info(
+                'No signal detected for '
+                f'{self.signal_wait_timeout_sec:.1f}s: starting left turn'
+            )
+            self._set_driving_state(self.STATE_LEFT_TURN, emit_log=False)
+            # 왼쪽 차선이 안정적으로 검출된 뒤에도 설정된 시간 동안
+            # 최대 좌조향을 유지하고 나서 차선 조향으로 복귀한다.
+            self.left_turn_timeout_enabled = False
+            self.require_lane_loss_before_reacquire = False
+            self.no_signal_left_turn = True
+            self.signal_left_turn_approach_started_at = None
+
+    def _signal_left_turn_approach_is_active(self):
+        if (
+            self.driving_state != self.STATE_LEFT_TURN
+            or self.no_signal_left_turn
+            or self.signal_left_turn_approach_started_at is None
+        ):
+            return False
+
+        elapsed_sec = (
+            self.get_clock().now() - self.signal_left_turn_approach_started_at
+        ).nanoseconds / 1e9
+        if elapsed_sec < self.signal_left_turn_approach_sec:
+            return True
+
+        self.signal_left_turn_approach_started_at = None
+        self.lane_was_lost_during_turn = False
+        self.lane_reacquisition_frames = 0
+        self.left_turn_frame_count = 0
+        self.get_logger().info(
+            'Signal intersection approach completed: maximum-left turn started'
+        )
+        return False
+
+    def _finish_no_signal_left_turn_hold_if_elapsed(self):
+        if (
+            self.driving_state != self.STATE_LEFT_TURN
+            or not self.no_signal_left_turn
+            or self.no_signal_lane_hold_started_at is None
+        ):
+            return
+
+        elapsed_sec = (
+            self.get_clock().now() - self.no_signal_lane_hold_started_at
+        ).nanoseconds / 1e9
+        if elapsed_sec >= self.no_signal_left_turn_hold_sec:
+            self.get_logger().info(
+                'No-signal maximum-left hold completed: lane driving resumed'
+            )
+            self._set_driving_state(self.STATE_DRIVE)
+
     def _set_driving_state(self, state, emit_log=True):
         self.driving_state = state
         self.pending_signal_state = None
         self.pending_signal_frames = 0
+        self.no_signal_left_turn = False
+        self.no_signal_lane_hold_started_at = None
+        self.signal_left_turn_approach_started_at = None
+        self.signal_wait_started_at = (
+            self.get_clock().now()
+            if state == self.STATE_SIGNAL_WAIT
+            else None
+        )
 
         if state == self.STATE_LEFT_TURN:
+            self.signal_left_turn_approach_started_at = self.get_clock().now()
             self.lane_was_lost_during_turn = False
+            self.require_lane_loss_before_reacquire = True
             self.lane_reacquisition_frames = 0
             self.left_turn_frame_count = 0
+            self.left_turn_timeout_enabled = True
             if emit_log:
                 self.get_logger().info(
-                    'Red and green confirmed: maximum-left turn started'
+                    'Red and green confirmed: straight intersection approach '
+                    'started'
                 )
         elif state == self.STATE_SIGNAL_WAIT and emit_log:
             self.get_logger().info(
@@ -226,30 +332,56 @@ class TrafficDetection(Node):
         elif state == self.STATE_DRIVE and emit_log:
             self.get_logger().info('Lane driving resumed')
 
-    def update_lane_reacquisition(self, image):
-        """Return control after the old lane is lost and a lane is reacquired."""
+    def update_lane_reacquisition(self):
+        """Return control when the required lane detectors are stable."""
         if self.driving_state != self.STATE_LEFT_TURN:
             return
 
-        self.left_turn_frame_count += 1
-        roi = image[ROI_Y_START:ROI_Y_END, :].copy()
-        lane_input = self.lane_preprocessing.run(roi)
-        lane_result = self.lane_detector.run(lane_input['warped_white'])
-        lane_detected = (
-            lane_result['left_detected'] or lane_result['right_detected']
-        )
+        if self._signal_left_turn_approach_is_active():
+            return
 
-        if not lane_detected:
+        self.left_turn_frame_count += 1
+        if self.no_signal_left_turn:
+            if self.no_signal_lane_hold_started_at is not None:
+                return
+
+            if self.left_lane_detected:
+                self.lane_reacquisition_frames += 1
+            else:
+                self.lane_reacquisition_frames = 0
+
+            if self.lane_reacquisition_frames >= self.lane_reacquire_frames:
+                self.no_signal_lane_hold_started_at = self.get_clock().now()
+                self.get_logger().info(
+                    'Left lane reacquired: maintaining maximum-left turn for '
+                    f'{self.no_signal_left_turn_hold_sec:.1f}s'
+                )
+            return
+
+        if self.require_lane_loss_before_reacquire:
+            lane_reacquired = (
+                self.left_lane_detected and self.right_lane_detected
+            )
+        else:
+            lane_reacquired = self.left_lane_detected
+
+        if not lane_reacquired:
             self.lane_was_lost_during_turn = True
             self.lane_reacquisition_frames = 0
-        elif self.lane_was_lost_during_turn:
+        elif (
+            not self.require_lane_loss_before_reacquire
+            or self.lane_was_lost_during_turn
+        ):
             self.lane_reacquisition_frames += 1
             if self.lane_reacquisition_frames >= self.lane_reacquire_frames:
                 self._set_driving_state(self.STATE_DRIVE)
                 return
 
         # 차선을 끝내 찾지 못한 채 최대 조향을 계속하는 상황을 제한한다.
-        if self.left_turn_frame_count >= self.left_turn_timeout_frames:
+        if (
+            self.left_turn_timeout_enabled
+            and self.left_turn_frame_count >= self.left_turn_timeout_frames
+        ):
             self.get_logger().warning(
                 'Lane reacquisition timed out: vehicle stopped'
             )
@@ -284,7 +416,6 @@ class TrafficDetection(Node):
             return
 
         self.detect_traffic_light(image)
-        self.update_lane_reacquisition(image)
         if TRAFFIC_DEBUG_LEVEL > 0:
             cv2.waitKey(1)
 

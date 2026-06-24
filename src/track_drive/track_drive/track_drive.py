@@ -9,7 +9,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int64MultiArray
 from xycar_msgs.msg import XycarMotor
 
 # =============================================
@@ -77,10 +77,19 @@ SPEED_MIN   = 3.0  # 커브 최소 속도
 SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
 
 # =============================================
+# 어린이 보호구역 감지 파라미터 (튜닝 필요)
+# =============================================
+SCHOOL_ZONE_ENTER_FRAMES = 5
+SCHOOL_ZONE_EXIT_FRAMES = 15
+SCHOOL_ZONE_YELLOW_RATIO = 2.0
+CENTER_MASK_X_START = 220
+CENTER_MASK_X_END = 420
+
+# =============================================
 # 정지선 검출 파라미터 (BEV warped_white 기준)
 # =============================================
-STOP_LINE_Y_START        = 190
-STOP_LINE_Y_END          = 300
+STOP_LINE_Y_START        = 170
+STOP_LINE_Y_END          = 280
 STOP_LINE_X_MARGIN       = 70
 STOP_LINE_MIN_WIDTH      = 260
 STOP_LINE_MIN_HEIGHT     = 3
@@ -267,6 +276,50 @@ class StopLineDetector:
             'debug_img': debug_img,
             'candidates': candidates,
         }
+
+
+# =============================================
+# SchoolZoneDetector
+# 흰색보다 노란색 차선이 우세하면 노란 양쪽 실선을 추종한다.
+# 중앙 노란 점선은 차선으로 오인하지 않도록 제거한다.
+# =============================================
+class SchoolZoneDetector:
+
+    def __init__(self):
+        self.school_zone_mode = False
+        self._frames = 0
+
+    def run(self, warped_white, warped_yellow):
+        yellow_px = int(np.count_nonzero(warped_yellow))
+        white_px = int(np.count_nonzero(warped_white))
+        is_yellow_dominant = (
+            yellow_px > max(white_px, 1) * SCHOOL_ZONE_YELLOW_RATIO
+        )
+
+        if is_yellow_dominant:
+            self._frames = max(self._frames, 0)
+            self._frames = min(
+                self._frames + 1,
+                SCHOOL_ZONE_ENTER_FRAMES,
+            )
+        else:
+            self._frames = min(self._frames, 0)
+            self._frames = max(
+                self._frames - 1,
+                -SCHOOL_ZONE_EXIT_FRAMES,
+            )
+
+        if self._frames >= SCHOOL_ZONE_ENTER_FRAMES:
+            self.school_zone_mode = True
+        elif self._frames <= -SCHOOL_ZONE_EXIT_FRAMES:
+            self.school_zone_mode = False
+
+        if not self.school_zone_mode:
+            return warped_white
+
+        lane_image = warped_yellow.copy()
+        lane_image[:, CENTER_MASK_X_START:CENTER_MASK_X_END] = 0
+        return lane_image
 
 
 # =============================================
@@ -634,7 +687,9 @@ class MainLoop(Node):
         self.image         = None
         self.new_image     = False
         self.stop_line_result = None
+        self.lane_image = None
         self.preprocessing = Preprocessing()
+        self.school_zone = SchoolZoneDetector()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
 
@@ -647,6 +702,11 @@ class MainLoop(Node):
 
         self.pub_motor = self.create_publisher(XycarMotor, '/xycar_motor', 10)
         self.pub_stop_line = self.create_publisher(Bool, '/stop_line', 10)
+        self.pub_lane_detection = self.create_publisher(
+            Int64MultiArray,
+            '/lane_detection_status',
+            10,
+        )
 
         self.get_logger().info('track_drive_2 started')
 
@@ -670,7 +730,18 @@ class MainLoop(Node):
 
         if DEBUG_LEVEL >= 1:
             if sw['debug_img'] is not None:
-                cv2.imshow('sliding_window', sw['debug_img'])
+                debug_image = sw['debug_img'].copy()
+                if self.school_zone.school_zone_mode:
+                    cv2.putText(
+                        debug_image,
+                        'SCHOOL ZONE',
+                        (10, debug_image.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
+                cv2.imshow('sliding_window', debug_image)
             else:
                 cv2.imshow('sliding_window', prep['warped_white'])
             cv2.imshow('stop_line', stop_line['debug_img'])
@@ -701,8 +772,22 @@ class MainLoop(Node):
             roi = self.image[ROI_Y_START:ROI_Y_END, :].copy()
 
             prep = self.preprocessing.run(roi)
-            sw   = self.slidewindow.run(prep['warped_white'])
+            # 같은 카메라 프레임을 반복 처리해 debounce가 즉시 끝나지
+            # 않도록 보호구역 판정은 새 영상마다 한 번만 갱신한다.
+            if is_new_image or self.lane_image is None:
+                self.lane_image = self.school_zone.run(
+                    prep['warped_white'],
+                    prep['warped_yellow'],
+                )
+            sw = self.slidewindow.run(self.lane_image)
             if is_new_image or self.stop_line_result is None:
+                lane_detection_message = Int64MultiArray()
+                lane_detection_message.data = [
+                    int(sw['left_detected']),
+                    int(sw['right_detected']),
+                ]
+                self.pub_lane_detection.publish(lane_detection_message)
+
                 self.stop_line_result = self.stop_line_detector.run(
                     prep['warped_white']
                 )
