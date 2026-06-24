@@ -302,7 +302,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 1.5
-        inflation_radius: 1.3 # [AD_MODIFIED]
+        inflation_radius: 1.7 # [AD_MODIFIED] robot_radius 1.6 이상으로 설정
       always_send_full_costmap: True
 
 map_server:
@@ -390,8 +390,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.52, 0.0, 1.0]
-    min_velocity: [-0.52, 0.0, -1.0]
+    max_velocity: [0.52, 0.0, 0.7]
+    min_velocity: [-0.52, 0.0, -0.7]
     max_accel: [2.5, 0.0, 3.2]
     max_decel: [-2.5, 0.0, -3.2]
     odom_topic: "/ad/odom" # [AD_MODIFIED]

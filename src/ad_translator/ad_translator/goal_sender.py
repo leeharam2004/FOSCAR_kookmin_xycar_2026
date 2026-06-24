@@ -43,9 +43,9 @@ class GoalSenderNode(Node):
         self.create_subscription(Int64MultiArray, '/traffic_light', self._traffic_light_callback, 10)
         self.get_logger().info('Waiting for follow_waypoints action server...')
         self._client.wait_for_server()
-        time.sleep(7)
+        time.sleep(15)
         self.get_logger().info('Waiting for green light...')
-        self._wait_for_green()
+        # self._wait_for_green() #임시!!
         self._send_goal()
         self.get_logger().info('Waiting 1s before sending waypoints...')
         time.sleep(1)
