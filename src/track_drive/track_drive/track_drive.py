@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import time
 import rclpy
 import cv2
 import numpy as np
@@ -9,7 +10,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import Bool, Int64MultiArray
+from std_msgs.msg import Bool, Int64MultiArray, String
 from xycar_msgs.msg import XycarMotor
 
 # =============================================
@@ -18,7 +19,10 @@ from xycar_msgs.msg import XycarMotor
 #   1 — sliding_window 창만 (지금은 birds_eye_binary로 대체)
 #   2 — 모든 창 표시
 # =============================================
-DEBUG_LEVEL = 1
+DEBUG_LEVEL         = 1
+YELLOW_TUNING       = False   # True로 바꾸면 yellow HSV 트랙바 창 활성화
+OVERTAKE_CAR_TUNING = False   # True로 바꾸면 overtake 차량 HSV 트랙바 + 마스크 창 활성화
+STANLEY_TUNING      = False   # True로 바꾸면 Stanley 파라미터 트랙바 창 활성화
 
 # =============================================
 # 파라미터 (튜닝 필요)
@@ -72,9 +76,23 @@ KI  = 0.0   # 적분
 KSW = 1.0   # 차선 위치 오차 가중치
 KFF = 0.0   # 커브 feedforward 게인
 
-SPEED_MAX   = 15.0  # 직선 최대 속도
-SPEED_MIN   = 3.0  # 커브 최소 속도
-SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
+SPEED_MAX   = 21.0  # 직선 최대 속도
+SPEED_MIN   = 6.0  # 커브 최소 속도
+SPEED_KD    = 27.0  # 떨림 기반 감속 게인 (d_error 기준)
+
+# =============================================
+# 컨트롤러 선택 및 공용 파라미터
+# =============================================
+CONTROLLER       = 'stanley'                              # 'pid' or 'stanley'
+CONTROLLER_LA_Y  = int(ROI_H * SW_LOOKAHEAD_Y_RATIO)     # BEV lookahead y (247)
+CONTROLLER_Y_CAR = ROI_H - SW_BOTTOM_OFFSET              # BEV 차량 위치 y (270)
+LANE_REF_R       = int(ROI_W * 0.75) - 28               # 우측 차선 기준 x (452)
+LANE_REF_L       = int(ROI_W * 0.25) + 28               # 좌측 차선 기준 x (188)
+
+# Stanley 파라미터 (튜닝 필요)
+STANLEY_HEADING_SCALE = 49.0   # slope → angle 단위 변환 게인
+STANLEY_K             = 1.7   # cross-track 게인
+STANLEY_V_MIN         = 1.0    # 속도 하한 (0 나눗셈 방지)
 
 # =============================================
 # 어린이 보호구역 감지 파라미터 (튜닝 필요)
@@ -106,6 +124,43 @@ STOP_LINE_CONFIRM_FRAMES = 3
 
 
 # =============================================
+# HSVTuner
+# YELLOW_TUNING / OVERTAKE_CAR_TUNING=True 일 때 생성된다.
+# name으로 트랙바 창·마스크 창을 구분하므로 여러 인스턴스 동시 사용 가능.
+# =============================================
+class HSVTuner:
+
+    def __init__(self, name, defaults, min_pixels=None):
+        self._win        = f'{name} HSV Tuning'
+        self._mask_win   = f'{name} Mask'
+        self._min_pixels = min_pixels
+
+        cv2.namedWindow(self._win, cv2.WINDOW_NORMAL)
+        for key, val in defaults.items():
+            hi = 179 if key.startswith('H') else 255
+            cv2.createTrackbar(key, self._win, val, hi, lambda _: None)
+        cv2.namedWindow(self._mask_win, cv2.WINDOW_NORMAL)
+
+    def get_range(self):
+        g = lambda n: cv2.getTrackbarPos(n, self._win)
+        lower = np.array([g('H_min'), g('S_min'), g('V_min')], dtype=np.uint8)
+        upper = np.array([g('H_max'), g('S_max'), g('V_max')], dtype=np.uint8)
+        return lower, upper
+
+    def show_mask(self, mask):
+        display = mask.copy()
+        label = f'pixels: {int(np.count_nonzero(mask))}'
+        if self._min_pixels is not None:
+            label += f'  min: {self._min_pixels}'
+        cv2.putText(display, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 255, 2)
+        cv2.imshow(self._mask_win, display)
+
+    def print_values(self):
+        lo, hi = self.get_range()
+        print(f'[HSVTuner:{self._win}] lower={lo.tolist()}  upper={hi.tolist()}')
+
+
+# =============================================
 # Preprocessing
 # HSV 이진화 + Birds Eye View 변환
 # ROS 없는 pure class — 이미지만 받고 결과 dict 반환
@@ -113,12 +168,13 @@ STOP_LINE_CONFIRM_FRAMES = 3
 class Preprocessing:
 
     def __init__(self, src_points=SRC_POINTS, dst_points=DST_POINTS,
-                 warped_size=WARPED_SIZE):
+                 warped_size=WARPED_SIZE, yellow_tuner=None):
 
         self.M     = cv2.getPerspectiveTransform(src_points, dst_points)
         self.M_inv = cv2.getPerspectiveTransform(dst_points, src_points)
         self.warped_size  = warped_size
         self._src_points  = src_points
+        self.yellow_tuner = yellow_tuner
 
     # -----------------------------------------
     # 외부에서 호출하는 메인 메서드
@@ -152,8 +208,15 @@ class Preprocessing:
 
         white_mask  = cv2.inRange(hsv, np.array([0,  0,  150]),
                                        np.array([180, 80, 255]))
-        yellow_mask = cv2.inRange(hsv, np.array([10, 80,  80]),
-                                       np.array([40, 255, 255]))
+
+        if self.yellow_tuner is not None:
+            lower_y, upper_y = self.yellow_tuner.get_range()
+        else:
+            lower_y = np.array([10, 242,  80])
+            upper_y = np.array([40, 255, 255])
+        yellow_mask = cv2.inRange(hsv, lower_y, upper_y)
+        if self.yellow_tuner is not None:
+            self.yellow_tuner.show_mask(yellow_mask)
 
         h, w = white_mask.shape[:2]
         road_roi = np.zeros_like(white_mask)
@@ -405,9 +468,6 @@ class SlideWindow:
         self.left_lane_detected   = False
         self.left_missing_windows = SW_NWINDOWS
 
-        # PID state
-        self.prev_error = 0.0
-        self.integral   = 0.0
 
     # -----------------------------------------
     # 히스토그램 기반 차선 시작점 탐색
@@ -512,16 +572,17 @@ class SlideWindow:
             return None, None
 
         if len(lane_x) >= 50:
-            fit       = np.polyfit(lane_y, lane_x, 2)
-            curvature = 2.0 * fit[0]
-            la        = int(np.polyval(fit, lookahead_y))
+            fit2 = np.polyfit(lane_y, lane_x, 2)   # cross-track lookahead 위치용
+            fit1 = np.polyfit(lane_y, lane_x, 1)   # heading 방향용 (fit1[0] = slope)
+            la   = int(np.polyval(fit2, lookahead_y))
         else:
-            curvature = 0.0
-            la        = int(lower_median)
+            fit2 = None
+            fit1 = None
+            la   = int(lower_median)
 
         la = int(np.clip(la, x_clip_lookahead[0], x_clip_lookahead[1]))
 
-        return curvature, la
+        return fit2, fit1, la
 
     # -----------------------------------------
     # 오른쪽 차선 x 범위 콜백
@@ -575,40 +636,32 @@ class SlideWindow:
         )
         self.right_missing_windows = missing
 
-        ref_r        = int(width * 0.75) - 28
         active_mid_y = int(SW_TOP_OFFSET + (height - SW_BOTTOM_OFFSET - SW_TOP_OFFSET) * SW_VALID_Y_RATIO)
 
         if len(rx) == 0:
-            return out_img, 0.0, self.rightx_la_previous - ref_r
+            return out_img, None, None, self.rightx_la_previous
 
         rx_arr, ry_arr   = np.array(rx), np.array(ry)
         bottom_right_cnt = int(np.sum((ry_arr >= active_mid_y) & (rx_arr >= width // 2)))
         if bottom_right_cnt < SW_MINPIX:
-            return out_img, 0.0, self.rightx_la_previous - ref_r
+            return out_img, None, None, self.rightx_la_previous
 
-        right_curve, rightx_la = self._fit_lane_curve(
+        right_fit2, right_fit1, rightx_la = self._fit_lane_curve(
             rx, ry, height, la_y,
             x_clip_lookahead = (int(width * 0.30), width - 1),
             validate_lower_median = lambda m: m >= int(width * 0.50),
         )
 
-        if right_curve is None:
-            return out_img, 0.0, self.rightx_la_previous - ref_r
+        if rightx_la is None:
+            return out_img, None, None, self.rightx_la_previous
 
         self.rightx_previous     = rightx_la
         self.rightx_la_previous  = rightx_la
         self.right_lane_detected = True
 
-        right_pos  = rightx_la - ref_r
-        right_curv = right_curve * CURV_SCALE
-
         cv2.circle(out_img, (rightx_la, la_y), 8, (255, 0, 0), -1)
-        cv2.putText(out_img, f'R curv: {right_curv:+.1f}',
-                    (width - 220, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
-        cv2.putText(out_img, f'R pos:  {right_pos:+d}',
-                    (width - 220, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
 
-        return out_img, right_curv, right_pos
+        return out_img, right_fit2, right_fit1, rightx_la
 
     # -----------------------------------------
     # 왼쪽 실선 탐지 (slidewindow_r 대칭, 오프셋만 다름)
@@ -639,129 +692,311 @@ class SlideWindow:
         )
         self.left_missing_windows = missing
 
-        ref_l        = int(width * 0.25) + 28
         active_mid_y = int(SW_TOP_OFFSET + (height - SW_BOTTOM_OFFSET - SW_TOP_OFFSET) * SW_VALID_Y_RATIO)
 
         if len(lx) == 0:
-            return 0.0, self.leftx_la_previous - ref_l
+            return None, None, self.leftx_la_previous
 
         lx_arr, ly_arr  = np.array(lx), np.array(ly)
         bottom_left_cnt = int(np.sum((ly_arr >= active_mid_y) & (lx_arr < width // 2)))
         if bottom_left_cnt < SW_MINPIX:
-            return 0.0, self.leftx_la_previous - ref_l
+            return None, None, self.leftx_la_previous
 
-        left_curve, leftx_la = self._fit_lane_curve(
+        left_fit2, left_fit1, leftx_la = self._fit_lane_curve(
             lx, ly, height, la_y,
             x_clip_lookahead = (0, int(width * 0.70)),
             validate_lower_median = lambda m: m <= int(width * 0.50),
         )
 
-        if left_curve is None:
-            return 0.0, self.leftx_la_previous - ref_l
+        if leftx_la is None:
+            return None, None, self.leftx_la_previous
 
         self.leftx_previous     = leftx_la
         self.leftx_la_previous  = leftx_la
         self.left_lane_detected = True
 
-        left_pos  = leftx_la - ref_l
-        left_curv = left_curve * CURV_SCALE
-
         cv2.circle(out_img, (leftx_la, la_y), 8, (255, 0, 255), -1)
-        cv2.putText(out_img, f'L curv: {left_curv:+.1f}',
-                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
-        cv2.putText(out_img, f'L pos:  {left_pos:+d}',
-                    (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
 
-        return left_curv, left_pos
+        return left_fit2, left_fit1, leftx_la
 
     # -----------------------------------------
     # 메인 실행
     # -----------------------------------------
     def run(self, warped_binary, skip_left=False):
-        out_img, right_curv, right_pos = self.slidewindow_r(warped_binary)
+        out_img, right_fit, right_fit1, rightx_la = self.slidewindow_r(warped_binary)
 
         if skip_left:
-            left_curv, left_pos = 0.0, 0.0
-            left_det  = False
+            left_fit, left_fit1, leftx_la = None, None, self.leftx_la_previous
+            left_det = False
         else:
-            left_curv, left_pos = self.slidewindow_l(warped_binary, out_img)
-            left_det  = self.left_lane_detected
+            left_fit, left_fit1, leftx_la = self.slidewindow_l(warped_binary, out_img)
+            left_det = self.left_lane_detected
 
         right_det = self.right_lane_detected
         r_valid   = max(0, SW_NWINDOWS - self.right_missing_windows)
         l_valid   = max(0, SW_NWINDOWS - self.left_missing_windows)
 
-        # --- error & curv ---
+        return {
+            'right_fit':      right_fit,    # 2차 (cross-track lookahead)
+            'left_fit':       left_fit,
+            'right_fit1':     right_fit1,   # 1차 (heading slope)
+            'left_fit1':      left_fit1,
+            'right_la':       rightx_la,
+            'left_la':        leftx_la,
+            'r_valid':        r_valid,
+            'l_valid':        l_valid,
+            'right_detected': right_det,
+            'left_detected':  left_det,
+            'debug_img':      out_img,
+        }
+
+
+# =============================================
+# PIDController
+# =============================================
+class PIDController:
+
+    def __init__(self):
+        self._prev_error = 0.0
+        self._integral   = 0.0
+
+    def compute(self, detection, ego_speed):
+        right_fit = detection['right_fit']
+        left_fit  = detection['left_fit']
+        right_det = detection['right_detected']
+        left_det  = detection['left_detected']
+        r_valid   = detection['r_valid']
+        l_valid   = detection['l_valid']
+        right_la  = detection['right_la']
+        left_la   = detection['left_la']
+
+        right_pos  = (right_la - LANE_REF_R) if right_det else 0.0
+        left_pos   = (left_la  - LANE_REF_L) if left_det  else 0.0
+        right_curv = (2.0 * right_fit[0] * CURV_SCALE) if (right_det and right_fit is not None) else 0.0
+        left_curv  = (2.0 * left_fit[0]  * CURV_SCALE) if (left_det  and left_fit  is not None) else 0.0
+
         if right_det and left_det:
             total = max(1, r_valid + l_valid)
             error = (r_valid * right_pos  + l_valid * left_pos)  / total
             curv  = (r_valid * right_curv + l_valid * left_curv) / total
         elif right_det:
-            error = float(right_pos)
-            curv  = float(right_curv)
+            error, curv = float(right_pos), float(right_curv)
         elif left_det:
-            error = float(left_pos)
-            curv  = float(left_curv)
+            error, curv = float(left_pos), float(left_curv)
         else:
-            error = 0.0
-            curv  = 0.0
+            error, curv = 0.0, 0.0
 
-        # --- PID (curv feedforward을 error에 합산) ---
-        error_total     = KSW * error + KFF * curv
-        d_error         = error_total - self.prev_error
-        self.integral   = float(np.clip(self.integral + error_total, -1000.0, 1000.0))
-        self.prev_error = error_total
+        error_total      = KSW * error + KFF * curv
+        d_error          = error_total - self._prev_error
+        self._integral   = float(np.clip(self._integral + error_total, -1000.0, 1000.0))
+        self._prev_error = error_total
 
-        raw_angle = KP * error_total + KD * d_error + KI * self.integral
+        raw_angle = KP * error_total + KD * d_error + KI * self._integral
         angle     = float(np.clip(raw_angle, -100.0, 100.0))
 
-        # --- angle 시각화 ---
-        height, width = warped_binary.shape[:2]
-        ax = int(np.clip(width // 2 + angle, 0, width - 1))
-        cv2.line(out_img, (width // 2, 0), (width // 2, height), (100, 100, 100), 1)
-        cv2.circle(out_img, (ax, SW_TOP_OFFSET // 2), 10, (0, 255, 0), -1)
-        cv2.putText(out_img, f'angle: {raw_angle:+.1f} -> {angle:+.1f}',
-                    (width // 2 - 100, SW_TOP_OFFSET // 2 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        t_angle = (abs(angle) / 100.0) ** 0.8
+        t_kd    = min(1.0, abs(SPEED_KD * d_error) / 100.0)
+        t       = max(t_angle, t_kd)
+        speed   = SPEED_MAX - (SPEED_MAX - SPEED_MIN) * t
+        if not right_det or not left_det:
+            speed = SPEED_MIN
 
-        return {
-            'angle':          angle,
-            'error':          error,
-            'curv':           curv,
-            'd_error':        d_error,
-            'debug_img':      out_img,
-            'right_detected': right_det,
-            'left_detected':  left_det,
+        return angle, speed
+
+
+# =============================================
+# StanleyController
+# θ_e: 차량 위치(CONTROLLER_Y_CAR)에서의 polynomial 기울기 → heading error
+# e: lookahead 위치의 cross-track error (pixel 단위)
+# =============================================
+class StanleyController:
+
+    _WIN = 'Stanley Tuning'
+
+    def __init__(self):
+        self._prev_e = 0.0
+        self._dbg    = {'e': 0.0, 'theta_e': 0.0, 'cross_correction': 0.0,
+                        'right_cross': 0.0, 'left_cross': 0.0}
+        if STANLEY_TUNING:
+            self._setup_tuner()
+
+    def _setup_tuner(self):
+        cv2.namedWindow(self._WIN, cv2.WINDOW_NORMAL)
+        bars = [
+            ('heading_scale', int(STANLEY_HEADING_SCALE), 200),
+            ('K_x10',         int(STANLEY_K * 10),        200),
+            ('speed_max',     int(SPEED_MAX),              30),
+            ('speed_min',     int(SPEED_MIN),              20),
+            ('speed_kd',      int(SPEED_KD),               500),
+        ]
+        for name, val, hi in bars:
+            cv2.createTrackbar(name, self._WIN, val, hi, lambda _: None)
+
+    def _get_params(self):
+        if not STANLEY_TUNING:
+            return STANLEY_HEADING_SCALE, STANLEY_K, SPEED_MAX, SPEED_MIN, SPEED_KD
+        g = lambda n: cv2.getTrackbarPos(n, self._WIN)
+        return (
+            float(g('heading_scale')),
+            g('K_x10') / 10.0,
+            float(g('speed_max')),
+            float(g('speed_min')),
+            float(g('speed_kd')),
+        )
+
+    def print_params(self):
+        h, k, smax, smin, skd = self._get_params()
+        print(f'[Stanley] heading_scale={h:.1f}  K={k:.1f}  speed_max={smax:.1f}  speed_min={smin:.1f}  speed_kd={skd:.1f}')
+
+    def compute(self, detection, ego_speed):
+        heading_scale, k, speed_max, speed_min, speed_kd = self._get_params()
+
+        right_fit1 = detection['right_fit1']   # 1차 (heading)
+        left_fit1  = detection['left_fit1']
+        right_det  = detection['right_detected']
+        left_det   = detection['left_detected']
+        r_valid    = detection['r_valid']
+        l_valid    = detection['l_valid']
+        right_la   = detection['right_la']
+        left_la    = detection['left_la']
+
+        # cross-track error (lookahead 기준, pixel)
+        right_pos = (right_la - LANE_REF_R) if right_det else 0.0
+        left_pos  = (left_la  - LANE_REF_L) if left_det  else 0.0
+
+        if right_det and left_det:
+            total = max(1, r_valid + l_valid)
+            e = (r_valid * right_pos + l_valid * left_pos) / total
+        elif right_det:
+            e = float(right_pos)
+        elif left_det:
+            e = float(left_pos)
+        else:
+            e = 0.0
+
+        # heading: 1차 피팅 기울기를 부호 반전
+        # BEV에서 y↓=근거리, y↑=전방이므로 우회전 시 fit1[0]=dx/dy < 0
+        # 조향 convention(우회전=양수)과 맞추려면 부호 반전 필요
+        r_slope = -right_fit1[0] if (right_det and right_fit1 is not None) else None
+        l_slope = -left_fit1[0]  if (left_det  and left_fit1  is not None) else None
+
+        if r_slope is not None and l_slope is not None:
+            total = max(1, r_valid + l_valid)
+            slope = (r_valid * r_slope + l_valid * l_slope) / total
+        elif r_slope is not None:
+            slope = r_slope
+        elif l_slope is not None:
+            slope = l_slope
+        else:
+            slope = 0.0
+
+        v = max(STANLEY_V_MIN, float(ego_speed))
+
+        theta_e          = slope * heading_scale
+        cross_correction = k * e / v
+        raw_angle        = theta_e + cross_correction
+        angle            = float(np.clip(raw_angle, -100.0, 100.0))
+
+        d_e          = e - self._prev_e
+        self._prev_e = e
+
+        t_angle = (abs(angle) / 100.0) ** 0.8
+        t_kd    = min(1.0, abs(speed_kd * d_e) / 100.0)
+        t       = max(t_angle, t_kd)
+        speed   = speed_max - (speed_max - speed_min) * t
+        if not right_det or not left_det:
+            speed = speed_min
+
+        self._dbg = {
+            'e':                e,
+            'theta_e':          theta_e,
+            'cross_correction': cross_correction,
+            'right_cross':      right_pos if right_det else None,
+            'left_cross':       left_pos  if left_det  else None,
         }
 
+        return angle, speed
 
 # =============================================
-# TODO: 리팩터링 제안 (재사용 시 적용 권장)
-#
-# [1] 탐지 / 제어 분리
-#   현재 SlideWindow.run()이 탐지 + PID 계산을 동시에 수행한다.
-#   탐지 결과로 angle(제어 출력)을 반환하는 구조는 PID를 전제로 설계된
-#   인터페이스이므로, 알고리즘 교체 시 탐지 코드까지 수정해야 한다.
-#
-#   개선안:
-#   - SlideWindow.detect() → 제어 알고리즘에 독립적인 기하 정보만 반환
-#       {'left_pos', 'right_pos', 'left_curv', 'right_curv',
-#        'left_det', 'right_det', 'd_error'}
-#   - PIDController 클래스 별도 생성 (kp, ki, kd, integral_limit 인자)
-#       pid.compute(error) → angle,  pid.reset() → 적분 초기화
-#   - MainLoop에서 detect() 결과를 가공 후 PID에 입력
-#       → 체크기/좌회전 등 외부 조건에 의한 탐지 결과 수정이 자연스러워짐
-#       → Pure Pursuit, Stanley 등 다른 알고리즘으로 교체 시 탐지 코드 무수정
-#
-# [2] 시각화 분리
-#   현재 slidewindow_r/l 내부에서 cv2.putText, cv2.circle을 직접 호출한다.
-#   탐지 로직과 시각화가 섞여 있어 테스트와 재사용이 어렵다.
-#
-#   개선안:
-#   - SlideWindow는 탐지 결과 수치만 반환, 그리기 코드 제거
-#   - _show_debug()에서 탐지 결과를 받아 일괄 렌더링
-#   - 시각화 ON/OFF가 DEBUG_LEVEL 한 곳에서만 결정됨
+# OvertakeDecision 게이트 파라미터
 # =============================================
+OVERTAKE_GATE_ENTER_FRAMES  = 5
+OVERTAKE_GATE_EXIT_FRAMES   = 5
+OVERTAKE_GATE_TIMEOUT_SEC   = 99999   # 사실상 비활성 — 필요 시 튜닝
+
+OVERTAKE_CAR_HSV_LOWER      = np.array([22, 128, 128], dtype=np.uint8)
+OVERTAKE_CAR_HSV_UPPER      = np.array([41, 193, 255], dtype=np.uint8)
+OVERTAKE_CAR_MIN_PIXELS     = 200     # 노이즈 방지 최소 픽셀 수
+
+# =============================================
+# OvertakeDecision
+# overtake_drive 노드의 제안값(state/motor_suggestion)을 받아
+# PID 출력에 적용할지 결정한다.
+# 게이트가 ACTIVE일 때만 제안값을 실제 출력에 반영한다.
+# =============================================
+class OvertakeDecision:
+
+    def __init__(self, logger, tuner=None):
+        self.logger     = logger
+        self.tuner      = tuner
+        self.state      = 'LANE1'
+        self.suggestion = None
+
+        self._gate_active  = False
+        self._enter_streak = 0
+        self._exit_streak  = 0
+        self._active_since = None
+
+    def update_state(self, msg):
+        if self._gate_active and msg.data != self.state:
+            self.logger.info(f'[overtake] state: {self.state} -> {msg.data}')
+        self.state = msg.data
+
+    def update_suggestion(self, msg):
+        self.suggestion = msg
+        if self._gate_active and self.state != 'LANE1':
+            self.logger.info(
+                f'[overtake] suggestion: angle={msg.angle:.1f}  speed={msg.speed:.1f}  state={self.state}')
+
+    def _detect_yellow_car(self, roi):
+        if self.tuner is not None:
+            lower, upper = self.tuner.get_range()
+        else:
+            lower, upper = OVERTAKE_CAR_HSV_LOWER, OVERTAKE_CAR_HSV_UPPER
+        hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, lower, upper)
+        if self.tuner is not None:
+            self.tuner.show_mask(mask)
+        return int(np.count_nonzero(mask)) >= OVERTAKE_CAR_MIN_PIXELS
+
+    def update_gate(self, roi, school_zone_active):
+        car_visible = self._detect_yellow_car(roi)
+
+        if not self._gate_active:
+            self._enter_streak = self._enter_streak + 1 if car_visible else 0
+            if self._enter_streak >= OVERTAKE_GATE_ENTER_FRAMES:
+                self._gate_active  = True
+                self._active_since = time.time()
+                self._exit_streak  = 0
+                self.logger.info('[overtake] gate ACTIVE')
+        else:
+            if time.time() - self._active_since >= OVERTAKE_GATE_TIMEOUT_SEC:
+                self._gate_active  = False
+                self._enter_streak = 0
+                self.logger.info('[overtake] gate INACTIVE (timeout)')
+                return
+
+            self._exit_streak = self._exit_streak + 1 if school_zone_active else 0
+            if self._exit_streak >= OVERTAKE_GATE_EXIT_FRAMES:
+                self._gate_active  = False
+                self._enter_streak = 0
+                self.logger.info('[overtake] gate INACTIVE (school zone)')
+
+    def apply(self, angle, speed):
+        if not self._gate_active or self.state == 'LANE1' or self.suggestion is None:
+            return angle, speed
+        return self.suggestion.angle, self.suggestion.speed
+
 
 # =============================================
 # MainLoop — 실제 ROS2 노드
@@ -778,11 +1013,25 @@ class MainLoop(Node):
         self.new_image     = False
         self.stop_line_result = None
         self.lane_image = None
-        self.preprocessing = Preprocessing()
+        yellow_tuner = HSVTuner(
+            'Yellow Lane',
+            dict(H_min=10, H_max=40, S_min=242, S_max=255, V_min=80, V_max=255),
+        ) if YELLOW_TUNING else None
+        overtake_tuner = HSVTuner(
+            'Overtake Car',
+            dict(H_min=13, H_max=54, S_min=128, S_max=193, V_min=128, V_max=255),
+            min_pixels=OVERTAKE_CAR_MIN_PIXELS,
+        ) if OVERTAKE_CAR_TUNING else None
+        self.preprocessing = Preprocessing(yellow_tuner=yellow_tuner)
         self.school_zone = SchoolZoneDetector()
         self.checkered_zone = CheckeredZoneDetector()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
+        self.overtake = OvertakeDecision(self.get_logger(), tuner=overtake_tuner)
+
+        self._pid        = PIDController()
+        self._stanley    = StanleyController()
+        self._last_speed = SPEED_MIN
 
         self.sub_cam = self.create_subscription(
             Image,
@@ -790,6 +1039,10 @@ class MainLoop(Node):
             self._cam_callback,
             qos_profile_sensor_data
         )
+        self.sub_overtake_state = self.create_subscription(
+            String, '/overtake/state', self.overtake.update_state, 10)
+        self.sub_overtake_suggestion = self.create_subscription(
+            XycarMotor, '/overtake/motor_suggestion', self.overtake.update_suggestion, 10)
 
         self.pub_motor = self.create_publisher(XycarMotor, '/lane_motor_cmd', 10)
         self.pub_stop_line = self.create_publisher(Bool, '/stop_line', 10)
@@ -814,7 +1067,7 @@ class MainLoop(Node):
     # DEBUG_LEVEL 1: sliding_window만 (미구현 시 birds_eye_binary 대체)
     # DEBUG_LEVEL 2: 전체
     # -----------------------------------------
-    def _show_debug(self, prep, sw, stop_line):
+    def _show_debug(self, prep, sw, stop_line, angle=0.0):
 
         if DEBUG_LEVEL == 0:
             return
@@ -822,11 +1075,36 @@ class MainLoop(Node):
         if DEBUG_LEVEL >= 1:
             if sw['debug_img'] is not None:
                 debug_image = sw['debug_img'].copy()
+                h, w = debug_image.shape[:2]
+                ax = int(np.clip(w // 2 + angle, 0, w - 1))
+                cv2.line(debug_image, (w // 2, 0), (w // 2, h), (100, 100, 100), 1)
+                cv2.circle(debug_image, (ax, SW_TOP_OFFSET // 2), 10, (0, 255, 0), -1)
+                cv2.putText(debug_image, f'angle: {angle:+.1f}  [{CONTROLLER}]',
+                            (w // 2 - 120, SW_TOP_OFFSET // 2 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+                if CONTROLLER == 'stanley':
+                    dbg = self._stanley._dbg
+                    # 우측 cross-track
+                    rc = dbg['right_cross']
+                    lc = dbg['left_cross']
+                    rc_str = f'R cross: {rc:+.0f}px' if rc is not None else 'R cross: --'
+                    lc_str = f'L cross: {lc:+.0f}px' if lc is not None else 'L cross: --'
+                    cv2.putText(debug_image, rc_str,
+                                (w - 210, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 100, 100), 2)
+                    cv2.putText(debug_image, lc_str,
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 100, 255), 2)
+                    # heading / cross-track 합산
+                    cv2.putText(debug_image,
+                                f'θ_e: {dbg["theta_e"]:+.1f}  e: {dbg["e"]:+.1f}px',
+                                (w // 2 - 120, SW_TOP_OFFSET // 2 + 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 255, 180), 2)
+
                 if self.school_zone.school_zone_mode:
                     cv2.putText(
                         debug_image,
                         'SCHOOL ZONE',
-                        (10, debug_image.shape[0] - 10),
+                        (10, h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
                         (0, 255, 255),
@@ -890,19 +1168,19 @@ class MainLoop(Node):
                 self.pub_stop_line.publish(stop_line_message)
             stop_line = self.stop_line_result
 
-            t_angle = (abs(sw['angle']) / 100.0) ** 0.8
-            t_kd    = min(1.0, abs(SPEED_KD * sw['d_error']) / 100.0)
-            t       = max(t_angle, t_kd)
-            speed   = SPEED_MAX - (SPEED_MAX - SPEED_MIN) * t
-            if not sw['right_detected'] or not sw['left_detected']:
-                speed = SPEED_MIN
+            ctrl = self._stanley if CONTROLLER == 'stanley' else self._pid
+            angle, speed = ctrl.compute(sw, self._last_speed)
+
+            self.overtake.update_gate(roi, self.school_zone.school_zone_mode)
+            angle, speed = self.overtake.apply(angle, speed)
+            self._last_speed = float(speed)
 
             msg = XycarMotor()
-            msg.angle = float(sw['angle'])
+            msg.angle = float(angle)
             msg.speed = float(speed)
             self.pub_motor.publish(msg)
 
-            self._show_debug(prep, sw, stop_line)
+            self._show_debug(prep, sw, stop_line, angle)
 
             if cv2.waitKey(1) & 0xFF == 27:
                 break

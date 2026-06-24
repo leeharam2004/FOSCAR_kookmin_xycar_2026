@@ -68,6 +68,14 @@ def generate_launch_description():
         parameters=[]
     )
 
+    # Overtake mission (LiDAR-based vehicle detection — suggestion only)
+    overtake_drive_node = Node(
+        package='track_drive',
+        executable='overtake_drive',
+        output='screen',
+        parameters=[]
+    )
+
     # 3. Static TF (base_link -> laser_frame)
     # 나중에 시뮬에서 주는 Static TF로 바꾸기
     static_tf_node = Node(
@@ -110,5 +118,6 @@ def generate_launch_description():
         pedestrian_detector_node,
         traffic_light_node,
         track_drive_node,
+        overtake_drive_node,
         goal_sender_node,
     ])

@@ -27,6 +27,12 @@ def generate_launch_description():
         ),
         Node(
             package='track_drive',
+            executable='overtake_drive',
+            name='overtake_drive',
+            output='screen',
+        ),
+        Node(
+            package='track_drive',
             executable='traffic_light',
             name='traffic_detection',
             output='screen',
