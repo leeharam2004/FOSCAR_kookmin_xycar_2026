@@ -72,7 +72,7 @@ KSW = 1.0   # 차선 위치 오차 가중치
 KFF = 0.0   # 커브 feedforward 게인
 
 SPEED_MAX   = 15.0  # 직선 최대 속도
-SPEED_MIN   = 3.0  # 커브 최소 속도
+SPEED_MIN   = 4.0  # 커브 최소 속도
 SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
 
 

@@ -188,7 +188,7 @@ class DeadReckoningNode(Node): #ros 노드인 메인 클래스
         # Pose covariance (x, y, yaw diagonal)
         odom.pose.covariance[0] = 0.2    # x
         odom.pose.covariance[7] = 0.2    # y
-        odom.pose.covariance[35] = 0.05  # yaw
+        odom.pose.covariance[35] = 0.05  # yaws
 
         # Twist covariance (vx, wz diagonal)
         odom.twist.covariance[0] = 0.1   # vx

@@ -59,10 +59,10 @@ ODOM_TOPIC = 'ad/odom'  # dead_reckoning.py(ad_tf_maker)가 publish하는 자차
 # =============================================
 LIDAR_FRONT_INDEX_OFFSET_DEG = 0.0  # 인덱스 0 기준으로 전방까지의 각도 (음수면 반대 방향으로 회전)
 
-ROI_LATERAL_MIN_M = -2.75  # 좌우 ROI 최소값(m), 폭 5.5m(-2.75~2.75)
-ROI_LATERAL_MAX_M = 2.75   # 좌우 ROI 최대값(m), 폭 5.5m(-2.75~2.75)
-ROI_FORWARD_MIN_M = 0.5    # 전방거리 ROI 최소값(m)
-ROI_FORWARD_MAX_M = 9.0    # 전방거리 ROI 최대값(m)
+ROI_LATERAL_MIN_M = -3.5   # 좌우 ROI 최소값(m), 폭 7m(-3.5~3.5)
+ROI_LATERAL_MAX_M = 3.5    # 좌우 ROI 최대값(m), 폭 7m(-3.5~3.5)
+ROI_FORWARD_MIN_M = 2.0    # 전방거리 ROI 최소값(m)
+ROI_FORWARD_MAX_M = 14.0   # 전방거리 ROI 최대값(m)
 
 # =============================================
 # 물체 추적 파라미터
@@ -78,15 +78,33 @@ ROI_FORWARD_MAX_M = 9.0    # 전방거리 ROI 최대값(m)
 LIDAR_MAX_JUMP_M = 0.5  # 이전 프레임과 좌표 차이가 이보다 크면 다른 물체로 보고 추적 리셋
 MAX_PLAUSIBLE_OBJECT_SPEED_MPS = 3.0  # 사람이 뛰어도 못 낼 속도(약 10.8km/h) 이상이면 추적 오류로 무시
 
+# 한 프레임 안에서 "같은 물체"로 묶을 인접 라이다 점들의 반경(거리) 차이 임계값(m).
+# 나무/표지판처럼 표면이 둥글거나 거친 정지 물체는 최근접점 1개만 추적하면, 차가
+# 지나가며 보는 각도가 바뀔 때 표면 위에서 최근접점이 옆으로 미끄러지듯 이동해
+# 마치 좌우로 움직이는 것처럼 보이는 오검출이 생긴다. 최근접점 주변에서 반경
+# 차이가 이 값 이내로 이어지는 점들을 한 물체(군집)로 보고 그 무게중심을 추적하면
+# 표면 미끄러짐이 평균화되어 정지 물체가 훨씬 안정적으로 정지 물체로 인식된다.
+CLUSTER_BREAK_M = 0.2
+
 # =============================================
 # 절대속도(지면 기준) 필터 — "좌우로 움직이는 물체"(보행자 등)만 정지 트리거로 인식
-# 장애물의 절대속도 벡터(vx, vy. 자차의 전진/회전을 보정하고 남은 값) 중 측면(y,
-# 좌우) 성분의 크기가 아래 기준 이상이어야 "정지 트리거"로 인식한다. 진행방향(x)
-# 성분만 있는 물체(예: 같은 차로로 나란히 움직이는 차)는 좌우로 움직이는 게 아니므로
-# 정지 트리거에서 제외된다. 정지 장애물(벽, 콘, 나무 등)도 vx=vy=0에 가까워 제외된다.
+# 장애물의 절대속도 벡터(vx, vy. 자차의 전진/회전을 보정하고 남은 값)의 크기가
+# ABS_SPEED_ZERO_EPS_MPS 미만이면 "절대속도 0"(완전히 정지한 물체)로 보고 무조건
+# 배제한다. 그 외에 측면(y, 좌우) 성분의 크기가 LATERAL_SPEED_MIN_MPS 이상이어야
+# "정지 트리거"로 인식한다. 진행방향(x) 성분만 있는 물체(예: 같은 차로로 나란히
+# 움직이는 차)는 좌우로 움직이는 게 아니므로 정지 트리거에서 제외된다.
+# 보행자 정지 반응을 빠르게 하기 위해 매 프레임 인스턴트 속도값을 그대로 쓴다
+# (평활화/누적이동거리 없음 — 추가 지연 없이 DETECT_CONFIRM_FRAMES만큼만 걸린다).
 # (자차 속도/회전각속도는 dead_reckoning.py가 publish하는 odom으로 얻는다)
+#
+# 자차가 좌/우회전 중이면 odom 회전각속도 추정 오차가 그대로 정지 장애물(나무 등)의
+# 겉보기 속도로 남는데, 그 오차는 장애물이 멀수록(거리 r에 비례) 커진다. 이를
+# 흡수하기 위해 "절대속도 0" 판정 허용 오차를 회전각속도·장애물 거리에 비례해
+# 늘린다(직진 중에는 ABS_SPEED_ZERO_EPS_MPS만 적용되어 보행자 반응 속도에 영향 없음).
 # =============================================
 LATERAL_SPEED_MIN_MPS = 1.0 / 3.6  # 1km/h -> m/s. 측면 속도가 이 값 이상이면 "좌우로 움직임"
+ABS_SPEED_ZERO_EPS_MPS = 0.05  # 이 값 미만이면 절대속도 0(완전 정지)으로 보고 무조건 배제
+YAW_COMPENSATION_ERROR_RATIO = 0.1  # 회전각속도 추정 오차 비율(거리 m당, rad/s당 m/s 오차 여유)
 
 # =============================================
 # 정지/재출발 디바운스
@@ -134,7 +152,10 @@ def lidar_front_index(scan):
 
 # =============================================
 # 전방 ROI 사각형(좌우 lateral_min~lateral_max, 전방거리 forward_min~forward_max)
-# 안에서 가장 가까운 유효 장애물 탐색.
+# 안에서 가장 가까운 물체(군집)를 탐색해 그 무게중심을 반환한다.
+# 최근접점 1개만 보면 둥글거나 거친 정지 물체(나무 등) 표면 위에서 최근접점이
+# 미끄러지듯 이동해 보이는 오검출이 생기므로, 최근접점과 인접해 반경 차이가
+# CLUSTER_BREAK_M 이내로 이어지는 점들을 한 물체로 묶어 무게중심을 쓴다.
 # 반환: {'distance': m, 'angle_deg': 전방 기준 각도(부호 포함)} 또는 None
 # =============================================
 def find_front_obstacle(scan, lateral_min, lateral_max, forward_min, forward_max):
@@ -144,7 +165,7 @@ def find_front_obstacle(scan, lateral_min, lateral_max, forward_min, forward_max
     if front_idx is None:
         return None
 
-    best_idx, best_dist = None, None
+    points = []  # (index, forward, lateral, distance), 인덱스 오름차순
     for i in range(n):
         d = ranges[i]
         if not math.isfinite(d) or d <= 0.0:
@@ -158,14 +179,29 @@ def find_front_obstacle(scan, lateral_min, lateral_max, forward_min, forward_max
         if not (lateral_min <= lateral <= lateral_max):
             continue
 
-        if best_dist is None or d < best_dist:
-            best_idx, best_dist = i, d
+        points.append((i, forward, lateral, d))
 
-    if best_idx is None:
+    if not points:
         return None
 
-    angle_deg = (best_idx - front_idx) * degree_per_index
-    return {'distance': best_dist, 'angle_deg': angle_deg}
+    best_local = min(range(len(points)), key=lambda k: points[k][3])
+
+    lo = best_local
+    while lo > 0 and points[lo][0] - points[lo - 1][0] == 1 \
+            and abs(points[lo][3] - points[lo - 1][3]) <= CLUSTER_BREAK_M:
+        lo -= 1
+    hi = best_local
+    while hi < len(points) - 1 and points[hi + 1][0] - points[hi][0] == 1 \
+            and abs(points[hi + 1][3] - points[hi][3]) <= CLUSTER_BREAK_M:
+        hi += 1
+
+    cluster = points[lo:hi + 1]
+    centroid_forward = sum(p[1] for p in cluster) / len(cluster)
+    centroid_lateral  = sum(p[2] for p in cluster) / len(cluster)
+
+    distance  = math.hypot(centroid_forward, centroid_lateral)
+    angle_deg = math.degrees(math.atan2(centroid_lateral, centroid_forward))
+    return {'distance': distance, 'angle_deg': angle_deg}
 
 
 # =============================================
@@ -198,6 +234,11 @@ class PedestrianDetectionNode(Node):
         self._track_time = None
 
         # 정지/재출발 디바운스용 연속 프레임 카운터
+        # moving_streak: 좌우로 움직이는 물체가 연속으로 잡힌 프레임 수(정지 진입 판정용)
+        # clear_streak : ROI 안에 어떤 물체도 없는(완전히 사라진) 연속 프레임 수(탈출 판정용).
+        #   "좌우로 움직이는지" 판정이 한두 프레임 흔들려도(잡음, 보행자가 잠깐 멈춤 등)
+        #   보행자가 ROI 안에 그대로 있다면 탈출 조건이 되어서는 안 되므로, 탈출은
+        #   moving 판정이 아니라 raw 장애물 자체가 사라졌는지로만 본다.
         self._moving_streak = 0
         self._clear_streak  = 0
 
@@ -364,9 +405,11 @@ class PedestrianDetectionNode(Node):
         return vx, vy
 
     # -----------------------------------------
-    # 절대속도가 0인(완전히 정지한) 물체는 먼저 제외하고, 남은 물체 중 측면(y, 좌우)
-    # 성분 |vy|가 LATERAL_SPEED_MIN_MPS 이상이면 "좌우로 움직이는 물체"로 보고
-    # 그 장애물을, 아니면(진행방향으로만 움직이는 물체 또는 추적 불가) None을 반환한다.
+    # 절대속도의 크기가 ABS_SPEED_ZERO_EPS_MPS(회전 중이면 odom 회전각속도 추정
+    # 오차를 보정하기 위해 거리·회전각속도에 비례해 넓어진 허용 오차) 미만이면
+    # "절대속도 0"(완전히 정지한 물체)로 보고 무조건 배제한다. 그 외에 측면(y, 좌우)
+    # 성분 |vy|가 LATERAL_SPEED_MIN_MPS 이상이면 "좌우로 움직이는 물체"로 보고 그
+    # 장애물을, 아니면(진행방향으로만 움직이는 물체 또는 추적 불가) None을 반환한다.
     # -----------------------------------------
     def _find_moving_obstacle(self, obstacle):
         velocity = self._track_object_velocity(obstacle)
@@ -374,8 +417,10 @@ class PedestrianDetectionNode(Node):
             return None
 
         vx, vy = velocity
-        if math.hypot(vx, vy) <= 0.0:
-            # 절대속도 0 -> 완전히 정지한 물체 -> 라이다 인식에서 제외
+        zero_eps = (ABS_SPEED_ZERO_EPS_MPS
+                    + YAW_COMPENSATION_ERROR_RATIO * abs(self.ego_yaw_rate_radps) * obstacle['distance'])
+        if math.hypot(vx, vy) < zero_eps:
+            # 절대속도 0(또는 회전 중 odom 오차 범위 안) -> 정지 물체 -> 무조건 배제
             return None
 
         return obstacle if abs(vy) >= LATERAL_SPEED_MIN_MPS else None
@@ -397,12 +442,20 @@ class PedestrianDetectionNode(Node):
 
             moving_obstacle = self._find_moving_obstacle(obstacle_raw)
 
+            # 정지 진입은 "좌우로 움직임"이 연속으로 확인되는지로 판단한다.
             if moving_obstacle is not None:
                 self._moving_streak += 1
-                self._clear_streak  = 0
             else:
-                self._clear_streak  += 1
                 self._moving_streak = 0
+
+            # 탈출은 "좌우로 움직임" 판정이 아니라 ROI 안의 raw 장애물 자체가
+            # 완전히 사라졌는지로만 판단한다. 보행자가 ROI 안에 있는 한(잠깐 멈추거나
+            # 측면속도 판정이 흔들려도) clear_streak이 쌓이지 않아 탈출/조금씩 전진하는
+            # 일이 없고, 완전히 멈춘 상태를 유지한다.
+            if obstacle_raw is None:
+                self._clear_streak += 1
+            else:
+                self._clear_streak = 0
 
             now = time.time()
 
