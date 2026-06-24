@@ -1,19 +1,5 @@
-# -1,521 +1,521 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#아오 커밋어떻게해
-#아직도 안
-# =============================================
-# ROS2 Xycar Lane Driving
-#
-# 개선 내용
-# 1. 더 먼 차선 탐지
-# 2. 커브 조기 인식
-# 3. 오른쪽 실선 기반 2차선 유지
-# 4. 노란 점선 중앙선 별도 인식
-# 5. 조향 반응 강화
-# 6. 커브길 곡선 2번째 까진 안정적 통과후 직진후 차선이탈 문제
-# =============================================
 
 import rclpy
 import cv2
@@ -21,1025 +7,620 @@ import numpy as np
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from xycar_msgs.msg import XycarMotor
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
+from xycar_msgs.msg import XycarMotor
+
+# =============================================
+# 디버그 레벨
+#   0 — 창 없음
+#   1 — sliding_window 창만 (지금은 birds_eye_binary로 대체)
+#   2 — 모든 창 표시
+# =============================================
+DEBUG_LEVEL = 1
+
+# =============================================
+# 파라미터 (튜닝 필요)
+# =============================================
+ROI_Y_START = 150
+ROI_Y_END   = 480
+ROI_H       = ROI_Y_END - ROI_Y_START   # 330
+ROI_W       = 640
+
+# BEV SRC: ROI 기준 사다리꼴 (좌하→우하→우상→좌상)
+
+BOTTOM_DIST = 893
+TOP_DIST = 190
+Y_OFFSET = 50
+
+SRC_POINTS = np.float32([
+    [320 - BOTTOM_DIST, ROI_H - Y_OFFSET],
+    [320 + BOTTOM_DIST, ROI_H - Y_OFFSET],
+    [320 + TOP_DIST,   160 - Y_OFFSET],
+    [320 - TOP_DIST,   160 - Y_OFFSET],
+])
+
+DST_MARGIN = 0
+DST_POINTS = np.float32([
+    [DST_MARGIN,         ROI_H],
+    [ROI_W - DST_MARGIN, ROI_H],
+    [ROI_W - DST_MARGIN,     0],
+    [DST_MARGIN,             0],
+])
+
+WARPED_SIZE = (ROI_W, ROI_H)
+
+# =============================================
+# 슬라이딩 윈도우 파라미터 (BEV warped_binary 기준, 튜닝 필요)
+# =============================================
+SW_NWINDOWS           = 10
+SW_MARGIN             = 45       # 윈도우 절반 폭 (px)
+SW_MINPIX             = 25       # 윈도우 이동 최소 픽셀
+SW_TOP_OFFSET         = 90       # 윈도우 추적 상단 한계 (px, 튜닝)
+SW_LOOKAHEAD_Y_RATIO  = 0.75     # lookahead y 위치 비율
+SW_BOTTOM_OFFSET      = 60       # 윈도우 시작을 바닥에서 이 px 위부터 (튜닝)
+SW_VALID_Y_RATIO      = 0.8      # 활성 구간 상단에서 이 비율 아래에 픽셀 있어야 유효 (0=전체, 1=맨아래)
+CURV_SCALE            = 6267     # curv → pos 단위 환산 (±0.03 → ±188)
+
+# =============================================
+# PID + Feedforward 파라미터 (튜닝 필요)
+# =============================================
+KP  = 2.0   # 비례
+KD  = 30.0   # 미분
+KI  = 0.0   # 적분
+KSW = 1.0   # 차선 위치 오차 가중치
+KFF = 0.0   # 커브 feedforward 게인
+
+SPEED_MAX   = 15.0  # 직선 최대 속도
+SPEED_MIN   = 3.0  # 커브 최소 속도
+SPEED_KD    = 100.0  # 떨림 기반 감속 게인 (d_error 기준)
 
 
 # =============================================
-# Sliding Window
+# Preprocessing
+# HSV 이진화 + Birds Eye View 변환
+# ROS 없는 pure class — 이미지만 받고 결과 dict 반환
+# =============================================
+class Preprocessing:
+
+    def __init__(self, src_points=SRC_POINTS, dst_points=DST_POINTS,
+                 warped_size=WARPED_SIZE):
+
+        self.M     = cv2.getPerspectiveTransform(src_points, dst_points)
+        self.M_inv = cv2.getPerspectiveTransform(dst_points, src_points)
+        self.warped_size  = warped_size
+        self._src_points  = src_points
+
+    # -----------------------------------------
+    # 외부에서 호출하는 메인 메서드
+    # roi: ROI 잘린 BGR 프레임
+    # 반환: dict
+    #   white_binary   — 흰 차선 이진 마스크
+    #   yellow_binary  — 노란 차선 이진 마스크
+    #   warped_binary  — BEV 변환된 합산 이진 마스크
+    #   warped_color   — BEV 변환된 컬러 이미지
+    #   annotated_roi  — SRC 사다리꼴 표시된 ROI
+    # -----------------------------------------
+    def run(self, roi):
+
+        white_binary, yellow_binary = self._binary(roi)
+
+        return {
+            'white_binary':   white_binary,
+            'yellow_binary':  yellow_binary,
+            'warped_white':   self._warp(white_binary),
+            'warped_yellow':  self._warp(yellow_binary),
+            'warped_color':   self._warp(roi),
+            'annotated_roi':  self._draw_src_polygon(roi),
+        }
+
+    # -----------------------------------------
+    # HSV 이진화
+    # -----------------------------------------
+    def _binary(self, frame):
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        white_mask  = cv2.inRange(hsv, np.array([0,  0,  150]),
+                                       np.array([180, 80, 255]))
+        yellow_mask = cv2.inRange(hsv, np.array([10, 80,  80]),
+                                       np.array([40, 255, 255]))
+
+        h, w = white_mask.shape[:2]
+        road_roi = np.zeros_like(white_mask)
+        cv2.fillPoly(road_roi, np.array([[
+            (0,              h),
+            (w - 1,          h),
+            (int(w * 0.95),  int(h * 0.10)),
+            (int(w * 0.05),  int(h * 0.10)),
+        ]], np.int32), 255)
+
+        kernel = np.ones((3, 3), np.uint8)
+
+        def clean(mask):
+            m = cv2.bitwise_and(mask, road_roi)
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel)
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+            m = cv2.GaussianBlur(m, (5, 5), 0)
+            _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+            return m
+
+        return clean(white_mask), clean(yellow_mask)
+
+    # -----------------------------------------
+    # Perspective warp
+    # -----------------------------------------
+    def _warp(self, img):
+        return cv2.warpPerspective(img, self.M, self.warped_size)
+
+    # -----------------------------------------
+    # BEV 좌표 → 원본 ROI 좌표 역변환
+    # SlideWindow 결과를 원본 이미지에 표시할 때 사용
+    # -----------------------------------------
+    def unwarp_points(self, points):
+        pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(pts, self.M_inv).reshape(-1, 2)
+
+    # -----------------------------------------
+    # SRC 사다리꼴 시각화 (튜닝용)
+    # -----------------------------------------
+    def _draw_src_polygon(self, frame):
+        overlay = frame.copy()
+        pts = self._src_points.astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(overlay, [pts], isClosed=True,
+                      color=(0, 255, 0), thickness=2)
+        for i, (x, y) in enumerate(self._src_points.astype(int)):
+            cv2.circle(overlay, (x, y), 6, (0, 0, 255), -1)
+            cv2.putText(overlay, str(i), (x + 8, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        return overlay
+
+
+# =============================================
+# SlideWindow
+# warped_binary → 차선 탐지 + PID 직전 값까지 계산
+#
+# run() 반환 dict:
+#   lane_center       — PID error = TARGET_X - lane_center
+#   curve_feedforward — 커브 보정값 (부호 있음)
+#   debug_img         — 시각화 이미지
+#   right_detected    / left_detected
 # =============================================
 class SlideWindow:
 
     def __init__(self):
 
-        self.x_previous = 320
-        self.rightx_previous = 580
-        self.rightx_lookahead_previous = 500
+        # 오른쪽 차선 상태
+        self.rightx_previous       = 480
+        self.rightx_la_previous    = 420
+        self.right_lane_detected   = False
+        self.right_missing_windows = SW_NWINDOWS
 
-    def slidewindow(self, img):
+        # 왼쪽 차선 상태
+        self.leftx_previous       = 160
+        self.leftx_la_previous    = 220
+        self.left_lane_detected   = False
+        self.left_missing_windows = SW_NWINDOWS
 
-        out_img = np.dstack((img, img, img))
+        # PID state
+        self.prev_error = 0.0
+        self.integral   = 0.0
 
+    # -----------------------------------------
+    # 히스토그램 기반 차선 시작점 탐색
+    # -----------------------------------------
+    def _find_lane_startx(self, img, x_start, x_end, y_ratio_start,
+                           x_previous, x_clip_max=None, jump_blend=True):
         height = img.shape[0]
-        width = img.shape[1]
+        if x_clip_max is None:
+            x_clip_max = x_end - 1
 
-        nonzero = img.nonzero()
-
-        nonzeroy = np.array(nonzero[0])
-
-        nonzerox = np.array(nonzero[1])
-
-        # =====================================
-        # 오른쪽 차선 시작점 탐색
-        # 중앙선 오인식을 막기 위해 아래쪽 오른쪽 영역만 사용
-        # =====================================
-        right_search_x = int(width * 0.52)
-
-        right_region = img[
-            int(height * 0.55):height,
-            right_search_x:width
-        ]
-
-        histogram = np.sum(
-            right_region,
-            axis=0
-        )
+        region    = img[int(height * y_ratio_start):height, x_start:x_end]
+        histogram = np.sum(region, axis=0)
 
         if len(histogram) == 0 or np.max(histogram) < 255 * 20:
+            return int(np.clip(x_previous, x_start, x_clip_max))
 
-            rightx_current = int(
-                np.clip(
-                    self.rightx_previous,
-                    right_search_x,
-                    width - 1
-                )
-            )
+        smooth     = np.convolve(histogram, np.ones(9), mode='same')
+        peak       = np.max(smooth)
+        candidates = np.where(smooth > peak * 0.35)[0] + x_start
 
+        if len(candidates) == 0:
+            startx = int(np.argmax(smooth)) + x_start
         else:
+            startx = int(candidates[np.argmin(np.abs(candidates - x_previous))])
 
-            smooth_histogram = np.convolve(
-                histogram,
-                np.ones(9),
-                mode='same'
-            )
+        if jump_blend and abs(startx - x_previous) > 160:
+            startx = int(0.65 * x_previous + 0.35 * startx)
 
-            peak_value = np.max(
-                smooth_histogram
-            )
+        return int(np.clip(startx, x_start, x_clip_max))
 
-            candidate_x = (
-                np.where(
-                    smooth_histogram > peak_value * 0.35
-                )[0] + right_search_x
-            )
+    # -----------------------------------------
+    # 슬라이딩 윈도우 공통 탐색
+    # get_x_bounds(idx, win_y_low, win_y_high) → (x_lower, x_upper)
+    # -----------------------------------------
+    def _run_sliding_window(self, img, startx, out_img=None,
+                             get_x_bounds=None,
+                             nwindows=SW_NWINDOWS, margin=SW_MARGIN,
+                             minpix=SW_MINPIX, rect_color=(255, 0, 0)):
+        height, width = img.shape[:2]
+        tracking_top  = SW_TOP_OFFSET
+        bottom        = height - SW_BOTTOM_OFFSET
+        window_height = max(1, int((bottom - tracking_top) / nwindows))
 
-            if len(candidate_x) == 0:
+        nz       = img.nonzero()
+        nonzeroy = np.array(nz[0])
+        nonzerox = np.array(nz[1])
 
-                rightx_current = (
-                    np.argmax(smooth_histogram)
-                    + right_search_x
-                )
+        current_x = startx
+        lane_inds = []
+        missing   = 0
 
+        for idx in range(nwindows):
+            win_y_low  = max(bottom - (idx + 1) * window_height, tracking_top)
+            win_y_high = bottom - idx * window_height
+
+            if get_x_bounds is not None:
+                x_lower, x_upper = get_x_bounds(idx, win_y_low, win_y_high)
             else:
+                x_lower, x_upper = 0, width - 1
 
-                rightx_current = int(
-                    candidate_x[
-                        np.argmin(
-                            np.abs(candidate_x - self.rightx_previous)
-                        )
-                    ]
-                )
+            current_x  = int(np.clip(current_x, x_lower, x_upper))
+            win_x_low  = max(current_x - margin, x_lower)
+            win_x_high = min(current_x + margin, x_upper)
 
-            if abs(rightx_current - self.rightx_previous) > 160:
+            if out_img is not None:
+                cv2.rectangle(out_img,
+                              (win_x_low, win_y_low),
+                              (win_x_high, win_y_high),
+                              rect_color, 2)
 
-                rightx_current = int(
-                    0.65 * self.rightx_previous +
-                    0.35 * rightx_current
-                )
+            good = (
+                (nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                (nonzerox >= win_x_low) & (nonzerox < win_x_high)
+            ).nonzero()[0]
+            lane_inds.append(good)
 
-            rightx_current = int(
-                np.clip(
-                    rightx_current,
-                    right_search_x,
-                    int(width * 0.93)
-                )
-            )
-
-        # =====================================
-        # sliding window parameter
-        # =====================================
-        nwindows = 12
-
-        window_height = int(
-            height / nwindows
-        )
-
-        margin = 55
-
-        minpix = 25
-
-        right_lane_inds = []
-
-        # =====================================
-        # sliding windows
-        # =====================================
-        for window in range(nwindows):
-
-            win_y_low = (
-                height - (window + 1) * window_height
-            )
-
-            win_y_high = (
-                height - window * window_height
-            )
-
-            # 아래쪽 윈도우는 반드시 오른쪽 차선 영역에서만 찾는다.
-            # 위쪽은 커브를 따라갈 수 있도록 조금 더 열어둔다.
-            if win_y_low > int(height * 0.45):
-
-                min_lane_x = int(width * 0.50)
-
+            if len(good) > minpix:
+                current_x = int(np.mean(nonzerox[good]))
             else:
+                missing += 1
 
-                min_lane_x = int(width * 0.30)
-
-            win_x_low = max(
-                rightx_current - margin, min_lane_x
-            )
-
-            win_x_high = min(
-                rightx_current + margin, width - 1
-            )
-
-            # draw window
-            cv2.rectangle(
-                out_img,
-                (win_x_low, win_y_low),
-                (win_x_high, win_y_high),
-                (255, 0, 0),
-                2
-            )
-
-            # lane pixels
-            good_inds = (
-                (
-                    (nonzeroy >= win_y_low) &
-                    (nonzeroy < win_y_high) &
-                    (nonzerox >= win_x_low) &
-                    (nonzerox < win_x_high)
-                ).nonzero()[0]
-            )
-
-            right_lane_inds.append(
-                good_inds
-            )
-
-            # 다음 윈도우 위치 이동
-            if len(good_inds) > minpix:
-
-                rightx_current = int(
-                    np.mean(
-                        nonzerox[good_inds]
-                    )
-                )
-
-        # concatenate
-        if len(right_lane_inds) > 0:
-
-            right_lane_inds = np.concatenate(
-                right_lane_inds
-            )
-
-        # =====================================
-        # 차선 못 찾으면 이전값 유지
-        # =====================================
-        if len(right_lane_inds) == 0:
-
-            return (
-                out_img,
-                self.x_previous,
-                self.rightx_previous,
-                self.rightx_lookahead_previous
-            )
-
-        # =====================================
-        # 중앙선/잡음으로 점프하는 경우 방지
-        # =====================================
-        lane_x = nonzerox[right_lane_inds]
-        lane_y = nonzeroy[right_lane_inds]
-
-        lower_lane = lane_y > int(height * 0.55)
-
-        if np.count_nonzero(lower_lane) < minpix:
-
-            return (
-                out_img,
-                self.x_previous,
-                self.rightx_previous,
-                self.rightx_lookahead_previous
-            )
-
-        lower_median_x = np.median(
-            lane_x[lower_lane]
+        all_inds = (
+            np.concatenate(lane_inds) if lane_inds else np.array([], dtype=int)
         )
+        return nonzerox[all_inds], nonzeroy[all_inds], missing
 
-        if lower_median_x < int(width * 0.55):
+    # -----------------------------------------
+    # Polyfit + 좌표 추출
+    # validate_lower_median: lambda m: bool  (None이면 검증 생략)
+    # -----------------------------------------
+    def _fit_lane_curve(self, lane_x, lane_y, height, lookahead_y,
+                         x_clip_lookahead,
+                         validate_lower_median=None):
+        lower_mask = lane_y > int(height * 0.55)
 
-            return (
-                out_img,
-                self.x_previous,
-                self.rightx_previous,
-                self.rightx_lookahead_previous
-            )
+        if np.count_nonzero(lower_mask) < 25:
+            return None, None
 
-        lookahead_y = int(height * 0.42)
+        lower_median = np.median(lane_x[lower_mask])
+
+        if validate_lower_median is not None and not validate_lower_median(lower_median):
+            return None, None
 
         if len(lane_x) >= 50:
-
-            fit = np.polyfit(
-                lane_y,
-                lane_x,
-                2
-            )
-
-            rightx = int(
-                np.polyval(
-                    fit,
-                    height - 1
-                )
-            )
-
-            rightx_lookahead = int(
-                np.polyval(
-                    fit,
-                    lookahead_y
-                )
-            )
-
+            fit       = np.polyfit(lane_y, lane_x, 2)
+            curvature = 2.0 * fit[0]
+            la        = int(np.polyval(fit, lookahead_y))
         else:
+            curvature = 0.0
+            la        = int(lower_median)
 
-            rightx = int(lower_median_x)
-            rightx_lookahead = rightx
+        la = int(np.clip(la, x_clip_lookahead[0], x_clip_lookahead[1]))
 
-        rightx = int(
-            np.clip(
-                rightx,
-                int(width * 0.55),
-                width - 1
-            )
+        return curvature, la
+
+    # -----------------------------------------
+    # 오른쪽 차선 x 범위 콜백
+    # -----------------------------------------
+    def _make_right_x_bounds(self, height, width):
+        def bounds(idx, win_y_low, win_y_high):
+            if win_y_low > int(height * 0.45):
+                return int(width * 0.50), width - 1
+            else:
+                return int(width * 0.30), width - 1
+        return bounds
+
+    # -----------------------------------------
+    # 왼쪽 차선 x 범위 콜백 (오른쪽 간격 제약 포함)
+    # -----------------------------------------
+    def _make_left_x_bounds(self, height, width):
+        def bounds(idx, win_y_low, win_y_high):
+            if win_y_low > int(height * 0.45):
+                return 0, int(width * 0.50)
+            else:
+                return 0, int(width * 0.70)
+        return bounds
+
+    # -----------------------------------------
+    # 오른쪽 실선 탐지
+    # 반환: (out_img, rightx, rightx_la)
+    # -----------------------------------------
+    def slidewindow_r(self, img):
+        self.right_lane_detected   = False
+        self.right_missing_windows = 0
+
+        out_img       = np.dstack((img, img, img))
+        height, width = img.shape[:2]
+        la_y          = int(height * SW_LOOKAHEAD_Y_RATIO)
+
+        startx = self._find_lane_startx(
+            img,
+            x_start       = int(width * 0.50),
+            x_end         = width,
+            y_ratio_start = 0.55,
+            x_previous    = self.rightx_previous,
+            x_clip_max    = int(width * 0.93),
+            jump_blend    = True,
         )
 
-        rightx_lookahead = int(
-            np.clip(
-                rightx_lookahead,
-                int(width * 0.30),
-                width - 1
-            )
+        rx, ry, missing = self._run_sliding_window(
+            img, startx,
+            out_img      = out_img,
+            get_x_bounds = self._make_right_x_bounds(height, width),
+            rect_color   = (255, 0, 0),
+        )
+        self.right_missing_windows = missing
+
+        ref_r        = int(width * 0.75) - 28
+        active_mid_y = int(SW_TOP_OFFSET + (height - SW_BOTTOM_OFFSET - SW_TOP_OFFSET) * SW_VALID_Y_RATIO)
+
+        if len(rx) == 0:
+            return out_img, 0.0, self.rightx_la_previous - ref_r
+
+        rx_arr, ry_arr   = np.array(rx), np.array(ry)
+        bottom_right_cnt = int(np.sum((ry_arr >= active_mid_y) & (rx_arr >= width // 2)))
+        if bottom_right_cnt < SW_MINPIX:
+            return out_img, 0.0, self.rightx_la_previous - ref_r
+
+        right_curve, rightx_la = self._fit_lane_curve(
+            rx, ry, height, la_y,
+            x_clip_lookahead = (int(width * 0.30), width - 1),
+            validate_lower_median = lambda m: m >= int(width * 0.50),
         )
 
-        # =====================================
-        # 2차선 중심 계산
-        # =====================================
-        lane_width_offset_bottom = 260
-        lane_width_offset_lookahead = 215
+        if right_curve is None:
+            return out_img, 0.0, self.rightx_la_previous - ref_r
 
-        bottom_center = (
-            rightx - lane_width_offset_bottom
+        self.rightx_previous     = rightx_la
+        self.rightx_la_previous  = rightx_la
+        self.right_lane_detected = True
+
+        right_pos  = rightx_la - ref_r
+        right_curv = right_curve * CURV_SCALE
+
+        cv2.circle(out_img, (rightx_la, la_y), 8, (255, 0, 0), -1)
+        cv2.putText(out_img, f'R curv: {right_curv:+.1f}',
+                    (width - 220, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
+        cv2.putText(out_img, f'R pos:  {right_pos:+d}',
+                    (width - 220, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
+
+        return out_img, right_curv, right_pos
+
+    # -----------------------------------------
+    # 왼쪽 실선 탐지 (slidewindow_r 대칭, 오프셋만 다름)
+    # 반환: (left_curve, leftx_la)
+    # -----------------------------------------
+    def slidewindow_l(self, img, out_img):
+        self.left_lane_detected   = False
+        self.left_missing_windows = 0
+
+        height, width = img.shape[:2]
+        la_y          = int(height * SW_LOOKAHEAD_Y_RATIO)
+
+        startx = self._find_lane_startx(
+            img,
+            x_start       = 0,
+            x_end         = int(width * 0.50),
+            y_ratio_start = 0.55,
+            x_previous    = self.leftx_previous,
+            x_clip_max    = int(width * 0.50) - 1,
+            jump_blend    = True,
         )
 
-        lookahead_center = (
-            rightx_lookahead - lane_width_offset_lookahead
+        lx, ly, missing = self._run_sliding_window(
+            img, startx,
+            out_img      = out_img,
+            get_x_bounds = self._make_left_x_bounds(height, width),
+            rect_color   = (255, 0, 255),
+        )
+        self.left_missing_windows = missing
+
+        ref_l        = int(width * 0.25) + 28
+        active_mid_y = int(SW_TOP_OFFSET + (height - SW_BOTTOM_OFFSET - SW_TOP_OFFSET) * SW_VALID_Y_RATIO)
+
+        if len(lx) == 0:
+            return 0.0, self.leftx_la_previous - ref_l
+
+        lx_arr, ly_arr  = np.array(lx), np.array(ly)
+        bottom_left_cnt = int(np.sum((ly_arr >= active_mid_y) & (lx_arr < width // 2)))
+        if bottom_left_cnt < SW_MINPIX:
+            return 0.0, self.leftx_la_previous - ref_l
+
+        left_curve, leftx_la = self._fit_lane_curve(
+            lx, ly, height, la_y,
+            x_clip_lookahead = (0, int(width * 0.70)),
+            validate_lower_median = lambda m: m <= int(width * 0.50),
         )
 
-        x_location = int(
-            0.65 * bottom_center +
-            0.35 * lookahead_center
-        )
+        if left_curve is None:
+            return 0.0, self.leftx_la_previous - ref_l
 
-        if abs(x_location - self.x_previous) > 110:
+        self.leftx_previous     = leftx_la
+        self.leftx_la_previous  = leftx_la
+        self.left_lane_detected = True
 
-            x_location = int(
-                0.65 * self.x_previous +
-                0.35 * x_location
-            )
+        left_pos  = leftx_la - ref_l
+        left_curv = left_curve * CURV_SCALE
 
-        self.rightx_previous = rightx
-        self.rightx_lookahead_previous = rightx_lookahead
+        cv2.circle(out_img, (leftx_la, la_y), 8, (255, 0, 255), -1)
+        cv2.putText(out_img, f'L curv: {left_curv:+.1f}',
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
+        cv2.putText(out_img, f'L pos:  {left_pos:+d}',
+                    (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
 
-        self.x_previous = x_location
+        return left_curv, left_pos
 
-        # =====================================
-        # debug
-        # =====================================
-        cv2.circle(
-            out_img,
-            (rightx, height - 20),
-            10,
-            (0, 255, 255),
-            -1
-        )
+    # -----------------------------------------
+    # 메인 실행
+    # -----------------------------------------
+    def run(self, warped_binary):
+        out_img, right_curv, right_pos = self.slidewindow_r(warped_binary)
+        left_curv,  left_pos           = self.slidewindow_l(warped_binary, out_img)
 
-        cv2.circle(
-            out_img,
-            (rightx_lookahead, lookahead_y),
-            8,
-            (255, 255, 0),
-            -1
-        )
+        right_det = self.right_lane_detected
+        left_det  = self.left_lane_detected
+        r_valid   = max(0, SW_NWINDOWS - self.right_missing_windows)
+        l_valid   = max(0, SW_NWINDOWS - self.left_missing_windows)
 
-        cv2.circle(
-            out_img,
-            (x_location, height - 40),
-            10,
-            (0, 0, 255),
-            -1
-        )
+        # --- error & curv ---
+        if right_det and left_det:
+            total = max(1, r_valid + l_valid)
+            error = (r_valid * right_pos  + l_valid * left_pos)  / total
+            curv  = (r_valid * right_curv + l_valid * left_curv) / total
+        elif right_det:
+            error = float(right_pos)
+            curv  = float(right_curv)
+        elif left_det:
+            error = float(left_pos)
+            curv  = float(left_curv)
+        else:
+            error = 0.0
+            curv  = 0.0
 
-        return out_img, x_location, rightx, rightx_lookahead
+        # --- PID (curv feedforward을 error에 합산) ---
+        error_total     = KSW * error + KFF * curv
+        d_error         = error_total - self.prev_error
+        self.integral   = float(np.clip(self.integral + error_total, -1000.0, 1000.0))
+        self.prev_error = error_total
+
+        raw_angle = KP * error_total + KD * d_error + KI * self.integral
+        angle     = float(np.clip(raw_angle, -100.0, 100.0))
+
+        # --- angle 시각화 ---
+        height, width = warped_binary.shape[:2]
+        ax = int(np.clip(width // 2 + angle, 0, width - 1))
+        cv2.line(out_img, (width // 2, 0), (width // 2, height), (100, 100, 100), 1)
+        cv2.circle(out_img, (ax, SW_TOP_OFFSET // 2), 10, (0, 255, 0), -1)
+        cv2.putText(out_img, f'angle: {raw_angle:+.1f} -> {angle:+.1f}',
+                    (width // 2 - 100, SW_TOP_OFFSET // 2 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+        return {
+            'angle':          angle,
+            'error':          error,
+            'curv':           curv,
+            'd_error':        d_error,
+            'debug_img':      out_img,
+            'right_detected': right_det,
+            'left_detected':  left_det,
+        }
 
 
 # =============================================
-# ROS2 Node
+# MainLoop — 실제 ROS2 노드
+# Preprocessing → SlideWindow 순서로 호출
 # =============================================
-class TrackDriverNode(Node):
+class MainLoop(Node):
 
     def __init__(self):
 
-        super().__init__('driver')
+        super().__init__('track_drive_2')
 
-        self.image = None
+        self.bridge        = CvBridge()
+        self.image         = None
+        self.preprocessing = Preprocessing()
+        self.slidewindow   = SlideWindow()
 
-        self.bridge = CvBridge()
-
-        self.slidewindow = SlideWindow()
-
-        self.motor_msg = XycarMotor()
-
-        # PID
-        self.prev_error = 0
-
-        self.integral = 0
-
-        self.prev_angle = 0
-
-        self.angle_history = []
-
-        self.yellowx_previous = None
-        self.yellow_lookahead_previous = None
-
-        self.yellow_miss_count = 0
-
-        # publisher
-        self.motor_pub = self.create_publisher(
-            XycarMotor,
-            'xycar_motor',
-            10
-        )
-
-        # subscriber
         self.sub_cam = self.create_subscription(
             Image,
             '/usb_cam/image_raw/front',
-            self.cam_callback,
+            self._cam_callback,
             qos_profile_sensor_data
         )
 
-        self.get_logger().info(
-            "===== Enhanced Lane Driving Start ====="
-        )
+        self.pub_motor = self.create_publisher(XycarMotor, '/xycar_motor', 10)
 
-    # =========================================
+        self.get_logger().info('track_drive_2 started')
+
+    # -----------------------------------------
     # callback
-    # =========================================
-    def cam_callback(self, data):
-
-        self.image = self.bridge.imgmsg_to_cv2(
-            data,
-            "bgr8"
-        )
-
-    # =========================================
-    # drive
-    # =========================================
-    def drive(self, angle, speed):
-
-        self.motor_msg.angle = float(angle)
-
-        self.motor_msg.speed = float(speed)
-
-        self.motor_pub.publish(
-            self.motor_msg
-        )
-
-    # =========================================
-    # preprocessing
-    # =========================================
-    def preprocessing(self, frame):
-
-        hsv = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2HSV
-        )
-
-        # =====================================
-        # white lane
-        # =====================================
-        lower_white = np.array([
-            0, 0, 150
-        ])
-
-        upper_white = np.array([
-            180, 80, 255
-        ])
-
-        white_mask = cv2.inRange(
-            hsv,
-            lower_white,
-            upper_white
-        )
-
-        # =====================================
-        # yellow lane
-        # =====================================
-        lower_yellow = np.array([
-            10, 80, 80
-        ])
-
-        upper_yellow = np.array([
-            40, 255, 255
-        ])
-
-        yellow_mask = cv2.inRange(
-            hsv,
-            lower_yellow,
-            upper_yellow
-        )
-
-        height = white_mask.shape[0]
-        width = white_mask.shape[1]
-
-        road_roi = np.zeros_like(
-            white_mask
-        )
-
-        road_polygon = np.array([[
-            (int(width * 0.02), height),
-            (int(width * 0.98), height),
-            (int(width * 0.82), int(height * 0.10)),
-            (int(width * 0.18), int(height * 0.10))
-        ]], np.int32)
-
-        cv2.fillPoly(
-            road_roi,
-            road_polygon,
-            255
-        )
-
-        white_lane = cv2.bitwise_and(
-            white_mask,
-            road_roi
-        )
-
-        yellow_center = cv2.bitwise_and(
-            yellow_mask,
-            road_roi
-        )
-
-        # morphology
-        kernel = np.ones(
-            (3, 3),
-            np.uint8
-        )
-
-        white_lane = cv2.morphologyEx(
-            white_lane,
-            cv2.MORPH_OPEN,
-            kernel
-        )
-
-        white_lane = cv2.morphologyEx(
-            white_lane,
-            cv2.MORPH_CLOSE,
-            kernel
-        )
-
-        yellow_center = cv2.morphologyEx(
-            yellow_center,
-            cv2.MORPH_OPEN,
-            kernel
-        )
-
-        # blur
-        white_lane = cv2.GaussianBlur(
-            white_lane,
-            (5, 5),
-            0
-        )
-
-        yellow_center = cv2.GaussianBlur(
-            yellow_center,
-            (5, 5),
-            0
-        )
-
-        _, white_lane = cv2.threshold(
-            white_lane,
-            127,
-            255,
-            cv2.THRESH_BINARY
-        )
-
-        _, yellow_center = cv2.threshold(
-            yellow_center,
-            127,
-            255,
-            cv2.THRESH_BINARY
-        )
-
-        return white_lane, yellow_center
-
-    # =========================================
-    # yellow dotted centerline
-    # =========================================
-    def detect_yellow_centerline(self, yellow_mask):
-
-        height = yellow_mask.shape[0]
-        width = yellow_mask.shape[1]
-        lookahead_y = int(height * 0.42)
-
-        center_roi = np.zeros_like(
-            yellow_mask
-        )
-
-        center_polygon = np.array([[
-            (int(width * 0.02), height),
-            (int(width * 0.76), height),
-            (int(width * 0.66), int(height * 0.12)),
-            (int(width * 0.08), int(height * 0.12))
-        ]], np.int32)
-
-        cv2.fillPoly(
-            center_roi,
-            center_polygon,
-            255
-        )
-
-        yellow_roi = cv2.bitwise_and(
-            yellow_mask,
-            center_roi
-        )
-
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            yellow_roi,
-            8
-        )
-
-        valid_mask = np.zeros_like(
-            yellow_roi
-        )
-
-        for label in range(1, num_labels):
-
-            area = stats[label, cv2.CC_STAT_AREA]
-            dash_width = stats[label, cv2.CC_STAT_WIDTH]
-            dash_height = stats[label, cv2.CC_STAT_HEIGHT]
-
-            if area >= 16 and dash_width >= 3 and dash_height >= 5:
-
-                valid_mask[labels == label] = 255
-
-        nonzero = valid_mask.nonzero()
-
-        if len(nonzero[0]) < 25:
-
-            self.yellow_miss_count += 1
-
-            if self.yellow_miss_count > 5:
-
-                self.yellowx_previous = None
-                self.yellow_lookahead_previous = None
-
-            return None, yellow_roi
-
-        yellow_y = np.array(nonzero[0])
-        yellow_x = np.array(nonzero[1])
-
-        lower_part = yellow_y > int(height * 0.35)
-
-        if np.count_nonzero(lower_part) >= 15:
-
-            fit_y = yellow_y[lower_part]
-            fit_x = yellow_x[lower_part]
-
-        else:
-
-            fit_y = yellow_y
-            fit_x = yellow_x
-
-        try:
-
-            degree = 2 if len(yellow_x) >= 80 else 1
-
-            fit = np.polyfit(
-                yellow_y,
-                yellow_x,
-                degree
-            )
-
-            yellow_x_bottom = int(
-                np.polyval(
-                    fit,
-                    height - 1
-                )
-            )
-
-            yellow_x_lookahead = int(
-                np.polyval(
-                    fit,
-                    lookahead_y
-                )
-            )
-
-        except Exception:
-
-            yellow_x_bottom = int(
-                np.median(
-                    fit_x
-                )
-            )
-
-            yellow_x_lookahead = yellow_x_bottom
-
-        yellow_x_bottom = int(
-            np.clip(
-                yellow_x_bottom,
-                0,
-                int(width * 0.72)
-            )
-        )
-
-        yellow_x_lookahead = int(
-            np.clip(
-                yellow_x_lookahead,
-                yellow_x_bottom - 145,
-                yellow_x_bottom + 145
-            )
-        )
-
-        yellow_x_lookahead = int(
-            np.clip(
-                yellow_x_lookahead,
-                0,
-                int(width * 0.76)
-            )
-        )
-
-        if self.yellowx_previous is not None:
-
-            yellow_x_bottom = int(
-                0.75 * self.yellowx_previous +
-                0.25 * yellow_x_bottom
-            )
-
-        if self.yellow_lookahead_previous is not None:
-
-            yellow_x_lookahead = int(
-                0.80 * self.yellow_lookahead_previous +
-                0.20 * yellow_x_lookahead
-            )
-
-        self.yellowx_previous = yellow_x_bottom
-        self.yellow_lookahead_previous = yellow_x_lookahead
-
-        self.yellow_miss_count = 0
-
-        yellow_info = {
-            "bottom_x": yellow_x_bottom,
-            "lookahead_x": yellow_x_lookahead,
-            "lookahead_y": lookahead_y
-        }
-
-        return yellow_info, valid_mask
-
-    # =========================================
-    # lane driving
-    # =========================================
-    def lane_driving(self, frame):
-
-        # =====================================
-        # 더 먼 차선까지 보도록 ROI 확대
-        # =====================================
-        roi = frame[
-            150:480,
-            :
-        ]
-
-        # =====================================
-        # 흰색 차선과 노란 중앙선을 따로 인식
-        # =====================================
-        white_binary, yellow_binary = self.preprocessing(
-            roi
-        )
-
-        # =====================================
-        # sliding window
-        # =====================================
-        out_img, lane_center, right_lane_x, right_lane_lookahead = (
-            self.slidewindow.slidewindow(
-                white_binary
-            )
-        )
-
-        yellow_info, yellow_debug = self.detect_yellow_centerline(
-            yellow_binary
-        )
-
-        # =====================================
-        # target center
-        # =====================================
-        target = 320
-
-        # =====================================
-        # 중앙선 침범 방지 + 실제 차로 중앙 보정
-        # =====================================
-        centerline_guard_x = target - 85
-        yellow_center_x = None
-        yellow_lookahead_x = None
-
-        if yellow_info is not None:
-
-            yellow_center_x = yellow_info["bottom_x"]
-            yellow_lookahead_x = yellow_info["lookahead_x"]
-
-            lane_width_bottom = (
-                right_lane_x - yellow_center_x
-            )
-
-            if 170 <= lane_width_bottom <= 430:
-
-                boundary_center = int(
-                    (
-                        right_lane_x +
-                        yellow_center_x
-                    ) / 2
-                )
-
-                lane_center = int(
-                    0.55 * lane_center +
-                    0.45 * boundary_center
-                )
-
+    # -----------------------------------------
+    def _cam_callback(self, data):
+        self.image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+
+    # -----------------------------------------
+    # debug 창 표시
+    # DEBUG_LEVEL 0: 없음
+    # DEBUG_LEVEL 1: sliding_window만 (미구현 시 birds_eye_binary 대체)
+    # DEBUG_LEVEL 2: 전체
+    # -----------------------------------------
+    def _show_debug(self, prep, sw):
+
+        if DEBUG_LEVEL == 0:
+            return
+
+        if DEBUG_LEVEL >= 1:
+            if sw['debug_img'] is not None:
+                cv2.imshow('sliding_window', sw['debug_img'])
             else:
+                cv2.imshow('sliding_window', prep['warped_white'])
 
-                yellow_based_center = int(
-                    yellow_center_x + 155
-                )
+        if DEBUG_LEVEL >= 2:
+            cv2.imshow('original_roi',    prep['annotated_roi'])
+            cv2.imshow('warped_white',    prep['warped_white'])
+            cv2.imshow('warped_yellow',   prep['warped_yellow'])
+            cv2.imshow('birds_eye_color', prep['warped_color'])
 
-                lane_center = int(
-                    0.70 * lane_center +
-                    0.30 * yellow_based_center
-                )
-
-            lane_width_lookahead = (
-                right_lane_lookahead - yellow_lookahead_x
-            )
-
-            if 130 <= lane_width_lookahead <= 390:
-
-                boundary_center_lookahead = int(
-                    (
-                        right_lane_lookahead +
-                        yellow_lookahead_x
-                    ) / 2
-                )
-
-                lane_center = int(
-                    0.82 * lane_center +
-                    0.18 * boundary_center_lookahead
-                )
-
-            min_center_from_yellow = (
-                yellow_center_x + 145
-            )
-
-            if lane_center < min_center_from_yellow:
-
-                lane_center = min_center_from_yellow
-
-            centerline_error = max(
-                0,
-                yellow_center_x - centerline_guard_x
-            )
-
-            if centerline_error > 0:
-
-                lane_center = int(
-                    min(
-                        white_binary.shape[1] - 1,
-                        lane_center + centerline_error * 1.1
-                    )
-                )
-
-        lane_center = int(
-            np.clip(
-                lane_center,
-                0,
-                white_binary.shape[1] - 1
-            )
-        )
-
-        curve_delta = (
-            right_lane_x - right_lane_lookahead
-        )
-
-        curve_feedforward = float(
-            np.clip(
-                curve_delta * 0.22,
-                -22,
-                22
-            )
-        )
-
-        # =====================================
-        # error
-        # =====================================
-        error = target - lane_center
-
-        # =====================================
-        # PID
-        # =====================================
-        kp = 1.08
-
-        kd = 0.32
-
-        ki = 0.0005
-
-        self.integral += error
-        self.integral = max(min(self.integral, 500), -500)
-
-        derivative = (
-            error - self.prev_error
-        )
-
-        angle = (
-            kp * error +
-            kd * derivative +
-            ki * self.integral +
-            curve_feedforward
-        )
-
-        self.prev_error = error
-
-        # =====================================
-        # smoothing 감소
-        # =====================================
-        if abs(error) > 50:              # 커브: 빠른 반응
-            angle = 0.45 * self.prev_angle + 0.55 * angle
-        else:                            # 직선: 부드럽게
-            angle = 0.70 * self.prev_angle + 0.30 * angle
-
-        self.prev_angle = angle
-
-        # =====================================
-        # steering limit
-        # =====================================
-        angle = max(
-            min(angle, 90),
-            -90
-        )
-
-        angle *= -1
-
-        # =====================================
-        # debug
-        # =====================================
-        cv2.line(
-            out_img,
-            (target, 0),
-            (target, out_img.shape[0]),
-            (0, 255, 0),
-            2
-        )
-
-        cv2.line(
-            out_img,
-            (centerline_guard_x, 0),
-            (centerline_guard_x, out_img.shape[0]),
-            (0, 165, 255),
-            2
-        )
-
-        if yellow_center_x is not None:
-
-            cv2.line(
-                out_img,
-                (yellow_center_x, 0),
-                (yellow_center_x, out_img.shape[0]),
-                (0, 255, 255),
-                2
-            )
-
-            cv2.circle(
-                out_img,
-                (yellow_lookahead_x, yellow_info["lookahead_y"]),
-                8,
-                (0, 255, 255),
-                -1
-            )
-
-            cv2.circle(
-                out_img,
-                (lane_center, out_img.shape[0] - 60),
-                8,
-                (255, 0, 255),
-                -1
-            )
-
-        binary = cv2.bitwise_or(
-            white_binary,
-            yellow_binary
-        )
-
-        cv2.imshow(
-            "binary",
-            binary
-        )
-
-        cv2.imshow(
-            "yellow_centerline",
-            yellow_debug
-        )
-
-        cv2.imshow(
-            "sliding_window",
-            out_img
-        )
-
-        print("lane_center:", lane_center)
-        print("target:", target)
-        print("error:", error)
-        print("angle:", angle)
-        print("yellow_center_x:", yellow_center_x)
-        print("yellow_lookahead_x:", yellow_lookahead_x)
-        print("right_lane_x:", right_lane_x)
-        print("right_lane_lookahead:", right_lane_lookahead)
-        print("curve_feedforward:", curve_feedforward)
-
-        return angle
-
-    # =========================================
+    # -----------------------------------------
     # main loop
-    # =========================================
-    def main_loop(self):
+    # -----------------------------------------
+    def run(self):
 
         while rclpy.ok():
 
-            rclpy.spin_once(
-                self,
-                timeout_sec=0.01
-            )
+            rclpy.spin_once(self, timeout_sec=0.01)
 
             if self.image is None:
                 continue
 
-            frame = self.image.copy()
+            roi = self.image[ROI_Y_START:ROI_Y_END, :].copy()
 
-            angle = self.lane_driving(
-                frame
-            )
+            prep = self.preprocessing.run(roi)
+            sw   = self.slidewindow.run(prep['warped_white'])
 
-            # =================================
-            # speed control
-            # =================================
-            self.angle_history.append(abs(angle))
-            if len(self.angle_history) > 10:
-                self.angle_history.pop(0)
-            max_recent = max(self.angle_history)
+            t_angle = (abs(sw['angle']) / 100.0) ** 0.8
+            t_kd    = min(1.0, abs(SPEED_KD * sw['d_error']) / 100.0)
+            t       = max(t_angle, t_kd)
+            speed   = SPEED_MAX - (SPEED_MAX - SPEED_MIN) * t
+            if not sw['right_detected'] or not sw['left_detected']:
+                speed = SPEED_MIN
 
-            speed = 3.5
-            if max_recent > 10: speed = 3
-            if max_recent > 25: speed = 2
-            if max_recent > 45: speed = 1.5
-            self.drive(angle, speed) 
-            cv2.imshow(
-                "camera",
-                frame
-            )
+            msg = XycarMotor()
+            msg.angle = float(sw['angle'])
+            msg.speed = float(speed)
+            self.pub_motor.publish(msg)
+
+            self._show_debug(prep, sw)
 
             if cv2.waitKey(1) & 0xFF == 27:
-
                 break
 
-    # =========================================
+    # -----------------------------------------
     # destroy
-    # =========================================
+    # -----------------------------------------
     def destroy(self):
-
-        self.drive(0, 0)
-
         cv2.destroyAllWindows()
-
         self.destroy_node()
 
 
@@ -1049,24 +630,16 @@ class TrackDriverNode(Node):
 def main(args=None):
 
     rclpy.init(args=args)
-
-    node = TrackDriverNode()
+    node = MainLoop()
 
     try:
-
-        node.main_loop()
-
+        node.run()
     except KeyboardInterrupt:
-
         pass
-
     finally:
-
         node.destroy()
-
         rclpy.shutdown()
 
 
 if __name__ == '__main__':
-
     main()
