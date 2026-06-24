@@ -24,7 +24,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'track_drive = track_drive.track_drive:main'
+            'track_drive = track_drive.track_drive:main',
+            'overtake_drive = track_drive.overtake_drive:main'
         ],
     },
 )
