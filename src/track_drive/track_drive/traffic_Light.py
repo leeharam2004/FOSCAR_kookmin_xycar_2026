@@ -27,6 +27,12 @@ class TrafficDetection(Node):
     TRAFFIC_ROI_TOP_RATIO = 0.0
     TRAFFIC_ROI_BOTTOM_RATIO = 0.55
 
+    # 좌측에서 교차로로 진입하는 경찰차의 경광등 검출 영역이다.
+    POLICE_ROI_X_START_RATIO = 0.0
+    POLICE_ROI_X_END_RATIO = 0.75
+    POLICE_ROI_Y_START_RATIO = 0.42
+    POLICE_ROI_Y_END_RATIO = 0.92
+
     def __init__(self):
         super().__init__('traffic_detection')
 
@@ -42,6 +48,10 @@ class TrafficDetection(Node):
         self.declare_parameter('signal_left_turn_approach_sec', 1.5)
         self.declare_parameter('signal_wait_timeout_sec', 3.0)
         self.declare_parameter('no_signal_left_turn_hold_sec', 7.0)
+        self.declare_parameter('police_blue_pixel_threshold', 12)
+        self.declare_parameter('police_red_pixel_threshold', 12)
+        self.declare_parameter('police_confirmation_frames', 3)
+        self.declare_parameter('police_clear_frames', 10)
         self.declare_parameter('lane_reacquire_frames', 3)
         self.declare_parameter('left_turn_timeout_frames', 150)
         self.red_pixel_threshold = int(
@@ -72,6 +82,22 @@ class TrafficDetection(Node):
             0.0,
             float(self.get_parameter('no_signal_left_turn_hold_sec').value),
         )
+        self.police_blue_pixel_threshold = max(
+            1,
+            int(self.get_parameter('police_blue_pixel_threshold').value),
+        )
+        self.police_red_pixel_threshold = max(
+            1,
+            int(self.get_parameter('police_red_pixel_threshold').value),
+        )
+        self.police_confirmation_frames = max(
+            1,
+            int(self.get_parameter('police_confirmation_frames').value),
+        )
+        self.police_clear_frames = max(
+            1,
+            int(self.get_parameter('police_clear_frames').value),
+        )
         self.lane_reacquire_frames = max(
             1,
             int(self.get_parameter('lane_reacquire_frames').value),
@@ -92,6 +118,9 @@ class TrafficDetection(Node):
         self.no_signal_left_turn = False
         self.no_signal_lane_hold_started_at = None
         self.signal_left_turn_approach_started_at = None
+        self.police_car_detected = False
+        self.police_detection_frames = 0
+        self.police_clear_frame_count = 0
         self.stop_line_detected = False
         self.left_lane_detected = False
         self.right_lane_detected = False
@@ -117,6 +146,11 @@ class TrafficDetection(Node):
             Int64MultiArray,
             '/green_center',
             1,
+        )
+        self.police_car_pub = self.create_publisher(
+            Bool,
+            '/police_car_detected',
+            10,
         )
         self.motor_subscription = self.create_subscription(
             XycarMotor,
@@ -215,6 +249,14 @@ class TrafficDetection(Node):
             candidate_state = self.STATE_DRIVE
         else:
             candidate_state = None
+
+        # 경찰차가 좌회전 충돌 구역에 있으면 신호 좌회전을 시작하지
+        # 않는다. 차량이 사라지면 현재 신호를 다시 확인해 출발한다.
+        if (
+            candidate_state == self.STATE_LEFT_TURN
+            and self.police_car_detected
+        ):
+            candidate_state = self.STATE_STOP
 
         if candidate_state is None:
             self.pending_signal_state = None
@@ -408,6 +450,99 @@ class TrafficDetection(Node):
     def nothing(_value):
         pass
 
+    def _update_police_detection(self, candidate_detected):
+        was_detected = self.police_car_detected
+
+        if candidate_detected:
+            self.police_detection_frames += 1
+            self.police_clear_frame_count = 0
+            if self.police_detection_frames >= self.police_confirmation_frames:
+                self.police_car_detected = True
+        else:
+            self.police_detection_frames = 0
+            if self.police_car_detected:
+                self.police_clear_frame_count += 1
+                if self.police_clear_frame_count >= self.police_clear_frames:
+                    self.police_car_detected = False
+                    self.police_clear_frame_count = 0
+
+        if self.police_car_detected and not was_detected:
+            self.get_logger().warning(
+                'Police car detected in left-turn path: holding position'
+            )
+            # 신호 좌회전 진입 중 발견한 경우에도 즉시 정지한다.
+            # 신호 미검출 교차로의 별도 좌회전 시퀀스는 유지한다.
+            if (
+                self.driving_state == self.STATE_LEFT_TURN
+                and not self.no_signal_left_turn
+            ):
+                self._set_driving_state(self.STATE_STOP, emit_log=False)
+        elif was_detected and not self.police_car_detected:
+            self.get_logger().info(
+                'Police car cleared: traffic-light decision resumed'
+            )
+
+    def detect_police_car(self, hsv_image):
+        """Detect paired emergency-light colors in the conflict ROI."""
+        height, width = hsv_image.shape[:2]
+        x_start = int(width * self.POLICE_ROI_X_START_RATIO)
+        x_end = int(width * self.POLICE_ROI_X_END_RATIO)
+        y_start = int(height * self.POLICE_ROI_Y_START_RATIO)
+        y_end = int(height * self.POLICE_ROI_Y_END_RATIO)
+
+        roi_mask = np.zeros((height, width), dtype=np.uint8)
+        roi_mask[y_start:y_end, x_start:x_end] = 255
+
+        blue_mask = cv2.inRange(
+            hsv_image,
+            np.array([90, 120, 80], dtype=np.uint8),
+            np.array([135, 255, 255], dtype=np.uint8),
+        )
+        red_mask_low = cv2.inRange(
+            hsv_image,
+            np.array([0, 150, 100], dtype=np.uint8),
+            np.array([10, 255, 255], dtype=np.uint8),
+        )
+        red_mask_high = cv2.inRange(
+            hsv_image,
+            np.array([170, 150, 100], dtype=np.uint8),
+            np.array([179, 255, 255], dtype=np.uint8),
+        )
+        red_mask = cv2.bitwise_or(red_mask_low, red_mask_high)
+
+        blue_mask = cv2.bitwise_and(blue_mask, roi_mask)
+        red_mask = cv2.bitwise_and(red_mask, roi_mask)
+        light_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        blue_mask = cv2.morphologyEx(
+            blue_mask,
+            cv2.MORPH_CLOSE,
+            light_kernel,
+        )
+        red_mask = cv2.morphologyEx(
+            red_mask,
+            cv2.MORPH_CLOSE,
+            light_kernel,
+        )
+
+        blue_pixel_count = int(np.count_nonzero(blue_mask))
+        red_pixel_count = int(np.count_nonzero(red_mask))
+        candidate_detected = (
+            blue_pixel_count >= self.police_blue_pixel_threshold
+            and red_pixel_count >= self.police_red_pixel_threshold
+        )
+        self._update_police_detection(candidate_detected)
+        police_message = Bool()
+        police_message.data = self.police_car_detected
+        self.police_car_pub.publish(police_message)
+
+        return {
+            'blue_mask': blue_mask,
+            'red_mask': red_mask,
+            'blue_pixel_count': blue_pixel_count,
+            'red_pixel_count': red_pixel_count,
+            'roi': (x_start, y_start, x_end, y_end),
+        }
+
     def camera_callback(self, message):
         try:
             image = self.bridge.imgmsg_to_cv2(message, 'bgr8')
@@ -499,6 +634,7 @@ class TrafficDetection(Node):
 
     def detect_traffic_light(self, image):
         hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        police_result = self.detect_police_car(hsv_image)
 
         height, width = image.shape[:2]
         roi_top = int(height * self.TRAFFIC_ROI_TOP_RATIO)
@@ -634,22 +770,63 @@ class TrafficDetection(Node):
             state_color,
             2,
         )
+        police_x_start, police_y_start, police_x_end, police_y_end = (
+            police_result['roi']
+        )
+        cv2.rectangle(
+            debug_image,
+            (police_x_start, police_y_start),
+            (police_x_end - 1, police_y_end - 1),
+            (0, 0, 255) if self.police_car_detected else (255, 128, 0),
+            2,
+        )
+        cv2.putText(
+            debug_image,
+            'police: '
+            f'{"DETECTED" if self.police_car_detected else "clear"} '
+            f'(B:{police_result["blue_pixel_count"]} '
+            f'R:{police_result["red_pixel_count"]})',
+            (15, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 255) if self.police_car_detected else (255, 255, 255),
+            2,
+        )
+        police_debug = cv2.bitwise_or(
+            police_result['blue_mask'],
+            police_result['red_mask'],
+        )
         if TRAFFIC_DEBUG_LEVEL >= 1:
             cv2.imshow('src', debug_image)
-            cv2.imshow('green_result', green_result)
         if TRAFFIC_DEBUG_LEVEL >= 2:
+            cv2.imshow('green_result', green_result)
+            cv2.imshow('police_result', police_debug)
             cv2.imshow('red_mask', red_mask)
             cv2.imshow('green_mask', green_mask)
             cv2.imshow('red_result', red_result)
             
 
 def _wait_for_nav2_completion():
-    """motor_translator가 /xycar_motor에 퍼블리시하다가 죽을 때까지 대기."""
+    """motor_translator가 /xycar_motor에 퍼블리시하다가 죽을 때까지 대기.
+    /nav2_bypass (Bool True) 수신 시 즉시 탈출 — Nav2 없는 런치에서 사용."""
     wait_node = rclpy.create_node('traffic_light_waiter')
     nav2_active = False
+    bypass = False
+
+    def _bypass_cb(msg):
+        nonlocal bypass
+        if msg.data:
+            bypass = True
+
+    wait_node.create_subscription(
+        Bool, '/nav2_bypass', _bypass_cb, 10,
+    )
+
     try:
         while rclpy.ok():
             rclpy.spin_once(wait_node, timeout_sec=0.5)
+            if bypass:
+                break
             count = wait_node.count_publishers('/xycar_motor')
             if count >= 1:
                 nav2_active = True

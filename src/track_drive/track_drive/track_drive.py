@@ -86,6 +86,15 @@ CENTER_MASK_X_START = 220
 CENTER_MASK_X_END = 420
 
 # =============================================
+# 체크기 구간 감지 파라미터 (BEV warped_color 하단 절반 기준)
+# =============================================
+CHECKERED_DARK_V_THRESHOLD  = 20     # HSV V < 이 값 → 거의 검정 픽셀
+CHECKERED_DARK_PIXEL_MIN    = 3000   # 검정 픽셀 최소 수 (튜닝)
+CHECKERED_WHITE_PIXEL_MIN   = 1000   # 동시에 흰 픽셀도 있어야 함 (그림자 오발동 방지)
+CHECKERED_ENTER_FRAMES      = 3
+CHECKERED_EXIT_FRAMES       = 10
+
+# =============================================
 # 정지선 검출 파라미터 (BEV warped_white 기준)
 # =============================================
 STOP_LINE_Y_START        = 170
@@ -320,6 +329,54 @@ class SchoolZoneDetector:
         lane_image = warped_yellow.copy()
         lane_image[:, CENTER_MASK_X_START:CENTER_MASK_X_END] = 0
         return lane_image
+
+
+# =============================================
+# CheckeredZoneDetector
+# BEV warped_color 하단 절반에서 검정+흰 픽셀이 동시에 많으면 체크기 구간으로 판정.
+# 체크기 구간에서는 왼쪽 차선 감지를 강제로 실패 처리한다.
+# =============================================
+class CheckeredZoneDetector:
+
+    def __init__(self):
+        self.active = False
+        self._frames = 0
+
+    def run(self, roi, white_binary):
+        height = roi.shape[0]
+        bottom_roi   = roi[height // 3:, :]
+        bottom_white = white_binary[height // 3:, :]
+
+        hsv = cv2.cvtColor(bottom_roi, cv2.COLOR_BGR2HSV)
+        dark_mask   = hsv[:, :, 2] < CHECKERED_DARK_V_THRESHOLD
+        dark_count  = int(np.count_nonzero(dark_mask))
+        white_count = int(np.count_nonzero(bottom_white))
+
+        is_checkered = (
+            dark_count  >= CHECKERED_DARK_PIXEL_MIN and
+            white_count >= CHECKERED_WHITE_PIXEL_MIN
+        )
+
+        if is_checkered:
+            self._frames = min(self._frames + 1, CHECKERED_ENTER_FRAMES)
+        else:
+            self._frames = max(self._frames - 1, -CHECKERED_EXIT_FRAMES)
+
+        if self._frames >= CHECKERED_ENTER_FRAMES:
+            self.active = True
+        elif self._frames <= -CHECKERED_EXIT_FRAMES:
+            self.active = False
+
+        if DEBUG_LEVEL >= 2:
+            debug_img = bottom_roi.copy()
+            debug_img[dark_mask] = (0, 0, 255)   # 검정 픽셀 → 빨강으로 표시
+            label = 'CHECKERED' if self.active else 'normal'
+            color = (0, 0, 255) if self.active else (0, 255, 0)
+            cv2.putText(debug_img, label,
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(debug_img, f'dark:{dark_count} white:{white_count}',
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            cv2.imshow('checkered_zone', debug_img)
 
 
 # =============================================
@@ -620,12 +677,17 @@ class SlideWindow:
     # -----------------------------------------
     # 메인 실행
     # -----------------------------------------
-    def run(self, warped_binary):
+    def run(self, warped_binary, skip_left=False):
         out_img, right_curv, right_pos = self.slidewindow_r(warped_binary)
-        left_curv,  left_pos           = self.slidewindow_l(warped_binary, out_img)
+
+        if skip_left:
+            left_curv, left_pos = 0.0, 0.0
+            left_det  = False
+        else:
+            left_curv, left_pos = self.slidewindow_l(warped_binary, out_img)
+            left_det  = self.left_lane_detected
 
         right_det = self.right_lane_detected
-        left_det  = self.left_lane_detected
         r_valid   = max(0, SW_NWINDOWS - self.right_missing_windows)
         l_valid   = max(0, SW_NWINDOWS - self.left_missing_windows)
 
@@ -674,6 +736,34 @@ class SlideWindow:
 
 
 # =============================================
+# TODO: 리팩터링 제안 (재사용 시 적용 권장)
+#
+# [1] 탐지 / 제어 분리
+#   현재 SlideWindow.run()이 탐지 + PID 계산을 동시에 수행한다.
+#   탐지 결과로 angle(제어 출력)을 반환하는 구조는 PID를 전제로 설계된
+#   인터페이스이므로, 알고리즘 교체 시 탐지 코드까지 수정해야 한다.
+#
+#   개선안:
+#   - SlideWindow.detect() → 제어 알고리즘에 독립적인 기하 정보만 반환
+#       {'left_pos', 'right_pos', 'left_curv', 'right_curv',
+#        'left_det', 'right_det', 'd_error'}
+#   - PIDController 클래스 별도 생성 (kp, ki, kd, integral_limit 인자)
+#       pid.compute(error) → angle,  pid.reset() → 적분 초기화
+#   - MainLoop에서 detect() 결과를 가공 후 PID에 입력
+#       → 체크기/좌회전 등 외부 조건에 의한 탐지 결과 수정이 자연스러워짐
+#       → Pure Pursuit, Stanley 등 다른 알고리즘으로 교체 시 탐지 코드 무수정
+#
+# [2] 시각화 분리
+#   현재 slidewindow_r/l 내부에서 cv2.putText, cv2.circle을 직접 호출한다.
+#   탐지 로직과 시각화가 섞여 있어 테스트와 재사용이 어렵다.
+#
+#   개선안:
+#   - SlideWindow는 탐지 결과 수치만 반환, 그리기 코드 제거
+#   - _show_debug()에서 탐지 결과를 받아 일괄 렌더링
+#   - 시각화 ON/OFF가 DEBUG_LEVEL 한 곳에서만 결정됨
+# =============================================
+
+# =============================================
 # MainLoop — 실제 ROS2 노드
 # Preprocessing → SlideWindow 순서로 호출
 # =============================================
@@ -690,6 +780,7 @@ class MainLoop(Node):
         self.lane_image = None
         self.preprocessing = Preprocessing()
         self.school_zone = SchoolZoneDetector()
+        self.checkered_zone = CheckeredZoneDetector()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
 
@@ -744,9 +835,9 @@ class MainLoop(Node):
                 cv2.imshow('sliding_window', debug_image)
             else:
                 cv2.imshow('sliding_window', prep['warped_white'])
-            cv2.imshow('stop_line', stop_line['debug_img'])
 
         if DEBUG_LEVEL >= 2:
+            cv2.imshow('stop_line', stop_line['debug_img'])
             cv2.imshow('original_roi',    prep['annotated_roi'])
             cv2.imshow('warped_white',    prep['warped_white'])
             cv2.imshow('warped_yellow',   prep['warped_yellow'])
@@ -779,7 +870,8 @@ class MainLoop(Node):
                     prep['warped_white'],
                     prep['warped_yellow'],
                 )
-            sw = self.slidewindow.run(self.lane_image)
+                self.checkered_zone.run(roi, prep['white_binary'])
+            sw = self.slidewindow.run(self.lane_image, skip_left=self.checkered_zone.active)
             if is_new_image or self.stop_line_result is None:
                 lane_detection_message = Int64MultiArray()
                 lane_detection_message.data = [

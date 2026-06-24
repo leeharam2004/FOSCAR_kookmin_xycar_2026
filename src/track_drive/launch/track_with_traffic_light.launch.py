@@ -1,17 +1,29 @@
 from launch import LaunchDescription
+from launch.actions import ExecuteProcess, TimerAction
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
     return LaunchDescription([
+        # Nav2 없는 환경에서 traffic_Light.py의 대기를 해제한다.
+        # 노드들이 구동되고 subscriber를 등록하기까지 2초 여유를 준다.
+        TimerAction(
+            period=2.0,
+            actions=[
+                ExecuteProcess(
+                    cmd=[
+                        'ros2', 'topic', 'pub', '--once',
+                        '/nav2_bypass', 'std_msgs/msg/Bool', 'data: true',
+                    ],
+                    output='screen',
+                ),
+            ],
+        ),
         Node(
             package='track_drive',
             executable='track_drive',
             name='track_drive_2',
             output='screen',
-            remappings=[
-                ('/xycar_motor', '/lane_motor_cmd'),
-            ],
         ),
         Node(
             package='track_drive',
