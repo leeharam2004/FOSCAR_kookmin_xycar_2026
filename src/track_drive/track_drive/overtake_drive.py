@@ -18,9 +18,11 @@
 #     다시 멀어지는 것처럼 보이는 기하학적 착시가 생겨 "빠른 차"로 오인된다.
 #     이를 막기 위해 r 대신 "진행방향 성분(x = r*cos(angle))"의 변화율을 상대속도로
 #     쓴다 — 정지 물체는 측면 위치(각도)와 무관하게 항상 -자차속도로 일정하게 줄어든다.
-#   - 이 상대속도에 /xycar_motor 속도(자차 속도 근사값)를 더하면 장애물의 절대속도가
-#     되고, 절대속도가 거의 0인 정지 장애물은 빠른 차/느린 차 판단 및 라이다 인식 창
-#     표시에서 모두 제외한다(움직이는 물체만 인식/표시).
+#   - 이 상대속도에 자차 속도를 더하면 장애물의 절대속도가 되는데, 자차 속도는
+#     dead_reckoning.py(ad_tf_maker)가 publish하는 ODOM_TOPIC(nav_msgs/Odometry,
+#     twist.twist.linear.x, m/s)을 구독해서 얻는다. 절대속도가 거의 0인 정지
+#     장애물은 빠른 차/느린 차 판단 및 라이다 인식 창 표시에서 모두 제외한다
+#     (움직이는 물체만 인식/표시).
 #   - track_drive.py가 /xycar_motor로 차량을 직접 제어하고 있으므로,
 #     이 노드는 모터를 건드리지 않고 계산값만 별도 토픽으로 publish한다.
 #     (/overtake/state: 현재 상태, /overtake/motor_suggestion: 계산된 조향/속도값)
@@ -35,10 +37,13 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from nav_msgs.msg import Odometry
 from rclpy.qos import qos_profile_sensor_data
 from xycar_msgs.msg import XycarMotor
 
 DEBUG_LEVEL = 1   # 0: 인식 창 없음, 1: 라이다 인식 창 표시
+
+ODOM_TOPIC = 'ad/odom'  # dead_reckoning.py(ad_tf_maker)가 publish하는 자차 odom 토픽
 
 # =============================================
 # 라이다 전방 인식 범위
@@ -180,7 +185,7 @@ class OvertakeNode(Node):
         self.state = STATE_LANE1
         self.scan  = None
 
-        # 자차 속도(절대속도 계산용). 실측 센서가 없어 /xycar_motor 명령 속도로 근사한다.
+        # 자차 속도(절대속도 계산용). dead_reckoning.py가 publish하는 odom에서 얻는다.
         self.ego_speed_mps = 0.0
 
         # 라이다 추적 상태 ("빠른 차"/"느린 차" 판단용). 진행방향(x)/측면(y) 성분으로
@@ -194,8 +199,8 @@ class OvertakeNode(Node):
 
         self.sub_scan = self.create_subscription(
             LaserScan, '/scan', self._scan_callback, qos_profile_sensor_data)
-        self.sub_motor = self.create_subscription(
-            XycarMotor, '/xycar_motor', self._motor_callback, 10)
+        self.sub_odom = self.create_subscription(
+            Odometry, ODOM_TOPIC, self._odom_callback, 10)
 
         self.pub_state      = self.create_publisher(String, '/overtake/state', 10)
         self.pub_suggestion = self.create_publisher(
@@ -213,9 +218,9 @@ class OvertakeNode(Node):
     def _scan_callback(self, msg):
         self.scan = msg
 
-    def _motor_callback(self, msg):
-        # speed는 LIDAR_*_AWAY_SPEED_MPS와 동일하게 km/h 스케일로 가정하고 m/s로 변환
-        self.ego_speed_mps = float(msg.speed) / 3.6
+    def _odom_callback(self, msg):
+        # dead_reckoning.py가 모터 명령으로 추정해 채운 odom의 twist.linear.x(m/s)
+        self.ego_speed_mps = float(msg.twist.twist.linear.x)
 
     # -----------------------------------------
     # 인식 창 초기화 (라이다 포인트 / 전방 탐지 콘 / 검출 장애물 표시)
