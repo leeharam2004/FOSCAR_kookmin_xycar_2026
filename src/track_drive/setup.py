@@ -25,7 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'track_drive = track_drive.track_drive:main',
-            'overtake_drive = track_drive.overtake_drive:main',
+            'pedestrian_detection = track_drive.pedestrian_detection:main',
             'traffic_light = track_drive.traffic_Light:main'
         ],
     },

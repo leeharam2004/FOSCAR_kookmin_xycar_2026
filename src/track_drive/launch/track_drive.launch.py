@@ -19,8 +19,8 @@ def generate_launch_description():
             ),
             Node(
                 package='track_drive',
-                executable='overtake_drive',
-                name='overtake_drive',
+                executable='pedestrian_detection',
+                name='pedestrian_detection',
                 output='screen',
             ),
             Node(
