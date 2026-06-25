@@ -90,7 +90,7 @@ LANE_REF_R       = int(ROI_W * 0.75) - 28               # 우측 차선 기준 x
 LANE_REF_L       = int(ROI_W * 0.25) + 28               # 좌측 차선 기준 x (188)
 
 # Stanley 파라미터 (튜닝 필요)
-STANLEY_HEADING_SCALE = 49.0   # slope → angle 단위 변환 게인
+STANLEY_HEADING_SCALE = 55.0   # slope → angle 단위 변환 게인
 STANLEY_K             = 1.7   # cross-track 게인
 STANLEY_V_MIN         = 1.0    # 속도 하한 (0 나눗셈 방지)
 
@@ -98,7 +98,7 @@ STANLEY_V_MIN         = 1.0    # 속도 하한 (0 나눗셈 방지)
 # 어린이 보호구역 감지 파라미터 (튜닝 필요)
 # =============================================
 SCHOOL_ZONE_ENTER_FRAMES = 5
-SCHOOL_ZONE_EXIT_FRAMES = 15
+SCHOOL_ZONE_EXIT_FRAMES = 7
 SCHOOL_ZONE_YELLOW_RATIO = 2.0
 CENTER_MASK_X_START = 220
 CENTER_MASK_X_END = 420
@@ -760,7 +760,7 @@ class PIDController:
         self._prev_error = 0.0
         self._integral   = 0.0
 
-    def compute(self, detection, ego_speed):
+    def compute(self, detection, ego_speed, lateral_offset=0.0, single_lane_ok=False):
         right_fit = detection['right_fit']
         left_fit  = detection['left_fit']
         right_det = detection['right_detected']
@@ -770,8 +770,8 @@ class PIDController:
         right_la  = detection['right_la']
         left_la   = detection['left_la']
 
-        right_pos  = (right_la - LANE_REF_R) if right_det else 0.0
-        left_pos   = (left_la  - LANE_REF_L) if left_det  else 0.0
+        right_pos  = (right_la - (LANE_REF_R - lateral_offset)) if right_det else 0.0
+        left_pos   = (left_la  - (LANE_REF_L - lateral_offset)) if left_det  else 0.0
         right_curv = (2.0 * right_fit[0] * CURV_SCALE) if (right_det and right_fit is not None) else 0.0
         left_curv  = (2.0 * left_fit[0]  * CURV_SCALE) if (left_det  and left_fit  is not None) else 0.0
 
@@ -798,7 +798,7 @@ class PIDController:
         t_kd    = min(1.0, abs(SPEED_KD * d_error) / 100.0)
         t       = max(t_angle, t_kd)
         speed   = SPEED_MAX - (SPEED_MAX - SPEED_MIN) * t
-        if not right_det or not left_det:
+        if not single_lane_ok and (not right_det or not left_det):
             speed = SPEED_MIN
 
         return angle, speed
@@ -848,7 +848,7 @@ class StanleyController:
         h, k, smax, smin, skd = self._get_params()
         print(f'[Stanley] heading_scale={h:.1f}  K={k:.1f}  speed_max={smax:.1f}  speed_min={smin:.1f}  speed_kd={skd:.1f}')
 
-    def compute(self, detection, ego_speed):
+    def compute(self, detection, ego_speed, lateral_offset=0.0, single_lane_ok=False):
         heading_scale, k, speed_max, speed_min, speed_kd = self._get_params()
 
         right_fit1 = detection['right_fit1']   # 1차 (heading)
@@ -861,8 +861,9 @@ class StanleyController:
         left_la    = detection['left_la']
 
         # cross-track error (lookahead 기준, pixel)
-        right_pos = (right_la - LANE_REF_R) if right_det else 0.0
-        left_pos  = (left_la  - LANE_REF_L) if left_det  else 0.0
+        # lateral_offset > 0: 우측 이동 — 기준점을 왼쪽으로 당겨 우조향 유도
+        right_pos = (right_la - (LANE_REF_R - lateral_offset)) if right_det else 0.0
+        left_pos  = (left_la  - (LANE_REF_L - lateral_offset)) if left_det  else 0.0
 
         if right_det and left_det:
             total = max(1, r_valid + l_valid)
@@ -904,7 +905,7 @@ class StanleyController:
         t_kd    = min(1.0, abs(speed_kd * d_e) / 100.0)
         t       = max(t_angle, t_kd)
         speed   = speed_max - (speed_max - speed_min) * t
-        if not right_det or not left_det:
+        if not single_lane_ok and (not right_det or not left_det):
             speed = speed_min
 
         self._dbg = {
@@ -929,12 +930,21 @@ OVERTAKE_CAR_HSV_UPPER      = np.array([41, 193, 255], dtype=np.uint8)
 OVERTAKE_CAR_MIN_PIXELS     = 200     # 노이즈 방지 최소 픽셀 수
 
 # =============================================
-# OvertakeDecision
+# 카메라 추월 파라미터 (CameraOvertakeDecision)
+# =============================================
+CAMERA_OVERTAKE_ENTER_FRAMES   = 5    # 노란 차 N프레임 연속 감지 → LANE2 (튜닝)
+CAMERA_OVERTAKE_LOSE_FRAMES    = 5   # 노란 차 M프레임 연속 미감지 → WAITING (튜닝)
+CAMERA_OVERTAKE_RETURN_FRAMES  = 1   # WAITING 후 LANE1 복귀 대기 프레임 (튜닝)
+CAMERA_OVERTAKE_LATERAL_OFFSET = 80  # Stanley 우측 offset px (LANE2, 튜닝)
+
+# =============================================
+# LidarOvertakeDecision (구 OvertakeDecision)
 # overtake_drive 노드의 제안값(state/motor_suggestion)을 받아
 # PID 출력에 적용할지 결정한다.
 # 게이트가 ACTIVE일 때만 제안값을 실제 출력에 반영한다.
+# CameraOvertakeDecision과 교환 가능 — self.overtake 할당 클래스만 변경.
 # =============================================
-class OvertakeDecision:
+class LidarOvertakeDecision:
 
     def __init__(self, logger, tuner=None):
         self.logger     = logger
@@ -992,10 +1002,104 @@ class OvertakeDecision:
                 self._enter_streak = 0
                 self.logger.info('[overtake] gate INACTIVE (school zone)')
 
+    def get_lateral_offset(self):
+        return 0.0
+
     def apply(self, angle, speed):
         if not self._gate_active or self.state == 'LANE1' or self.suggestion is None:
             return angle, speed
         return self.suggestion.angle, self.suggestion.speed
+
+
+# =============================================
+# CameraOvertakeDecision
+# 카메라 HSV 기반 노란 차 감지로 추월 구간을 판단.
+# overtake_drive 노드 없이 동작하며 LidarOvertakeDecision과 교환 가능.
+#
+# 상태:
+#   LANE1  : 중앙 주행  — lateral_offset = 0
+#   LANE2  : 우측 주행  — lateral_offset = CAMERA_OVERTAKE_LATERAL_OFFSET (양수)
+#   WAITING: 차 소실 후 대기 — lateral_offset 유지, 타임아웃 후 LANE1
+#
+# 전환:
+#   LANE1  → LANE2   : 노란 차 ENTER_FRAMES 연속 감지
+#   LANE2  → WAITING : 노란 차 LOSE_FRAMES 연속 미감지
+#   WAITING→ LANE2   : 노란 차 재감지 (아직 앞에 있음)
+#   WAITING→ LANE1   : RETURN_FRAMES 경과 → offset=0
+#   any    → LANE1   : school_zone_active → offset=0 (중앙)
+# =============================================
+class CameraOvertakeDecision:
+
+    _LANE1   = 'LANE1'
+    _LANE2   = 'LANE2'
+    _WAITING = 'WAITING'
+
+    def __init__(self, logger, tuner=None):
+        self.logger          = logger
+        self.tuner           = tuner
+        self._state          = self._LANE1
+        self._lateral_offset = 0.0
+
+        self._enter_streak = 0   # 연속 감지 프레임 (LANE1→LANE2)
+        self._lose_streak  = 0   # 연속 미감지 프레임 (LANE2→WAITING)
+        self._wait_frames  = 0   # WAITING 경과 프레임
+
+    def _detect_yellow_car(self, roi):
+        if self.tuner is not None:
+            lower, upper = self.tuner.get_range()
+        else:
+            lower, upper = OVERTAKE_CAR_HSV_LOWER, OVERTAKE_CAR_HSV_UPPER
+        hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, lower, upper)
+        if self.tuner is not None:
+            self.tuner.show_mask(mask)
+        return int(np.count_nonzero(mask)) >= OVERTAKE_CAR_MIN_PIXELS
+
+    def _enter(self, state):
+        if self._state != state:
+            self.logger.info(f'[camera_overtake] {self._state} → {state}')
+            self._state = state
+
+    def update_gate(self, roi, school_zone_active):
+        if school_zone_active:
+            self._enter(self._LANE1)
+            self._lateral_offset = 0.0
+            self._enter_streak = self._lose_streak = self._wait_frames = 0
+            return
+
+        car_visible = self._detect_yellow_car(roi)
+
+        if self._state == self._LANE1:
+            self._enter_streak = self._enter_streak + 1 if car_visible else 0
+            if self._enter_streak >= CAMERA_OVERTAKE_ENTER_FRAMES:
+                self._enter(self._LANE2)
+                self._lateral_offset = float(CAMERA_OVERTAKE_LATERAL_OFFSET)
+                self._lose_streak = 0
+
+        elif self._state == self._LANE2:
+            if car_visible:
+                self._lose_streak = 0
+            else:
+                self._lose_streak += 1
+                if self._lose_streak >= CAMERA_OVERTAKE_LOSE_FRAMES:
+                    self._enter(self._WAITING)
+                    self._wait_frames = 0
+
+        elif self._state == self._WAITING:
+            if car_visible:
+                self._enter(self._LANE2)
+                self._lose_streak = 0
+            else:
+                self._wait_frames += 1
+                if self._wait_frames >= CAMERA_OVERTAKE_RETURN_FRAMES:
+                    self._enter(self._LANE1)
+                    self._lateral_offset = 0.0
+
+    def get_lateral_offset(self):
+        return self._lateral_offset
+
+    def apply(self, angle, speed):
+        return angle, speed
 
 
 # =============================================
@@ -1027,7 +1131,8 @@ class MainLoop(Node):
         self.checkered_zone = CheckeredZoneDetector()
         self.slidewindow   = SlideWindow()
         self.stop_line_detector = StopLineDetector()
-        self.overtake = OvertakeDecision(self.get_logger(), tuner=overtake_tuner)
+        # 교환 포인트: CameraOvertakeDecision ↔ LidarOvertakeDecision
+        self.overtake = CameraOvertakeDecision(self.get_logger(), tuner=overtake_tuner)
 
         self._pid        = PIDController()
         self._stanley    = StanleyController()
@@ -1039,10 +1144,11 @@ class MainLoop(Node):
             self._cam_callback,
             qos_profile_sensor_data
         )
-        self.sub_overtake_state = self.create_subscription(
-            String, '/overtake/state', self.overtake.update_state, 10)
-        self.sub_overtake_suggestion = self.create_subscription(
-            XycarMotor, '/overtake/motor_suggestion', self.overtake.update_suggestion, 10)
+        # LidarOvertakeDecision 사용 시에만 활성화
+        # self.sub_overtake_state = self.create_subscription(
+        #     String, '/overtake/state', self.overtake.update_state, 10)
+        # self.sub_overtake_suggestion = self.create_subscription(
+        #     XycarMotor, '/overtake/motor_suggestion', self.overtake.update_suggestion, 10)
 
         self.pub_motor = self.create_publisher(XycarMotor, '/lane_motor_cmd', 10)
         self.pub_stop_line = self.create_publisher(Bool, '/stop_line', 10)
@@ -1168,11 +1274,17 @@ class MainLoop(Node):
                 self.pub_stop_line.publish(stop_line_message)
             stop_line = self.stop_line_result
 
-            ctrl = self._stanley if CONTROLLER == 'stanley' else self._pid
-            angle, speed = ctrl.compute(sw, self._last_speed)
-
             self.overtake.update_gate(roi, self.school_zone.school_zone_mode)
-            angle, speed = self.overtake.apply(angle, speed)
+            lateral_offset = self.overtake.get_lateral_offset()
+
+            single_lane_ok = sw['right_detected'] or sw['left_detected']
+            ctrl = self._stanley if CONTROLLER == 'stanley' else self._pid
+            angle, speed = ctrl.compute(sw, self._last_speed,
+                                        lateral_offset=lateral_offset,
+                                        single_lane_ok=single_lane_ok)
+
+            # LidarOvertakeDecision 사용 시 활성화 (각도/속도 직접 override)
+            # angle, speed = self.overtake.apply(angle, speed)
             self._last_speed = float(speed)
 
             msg = XycarMotor()

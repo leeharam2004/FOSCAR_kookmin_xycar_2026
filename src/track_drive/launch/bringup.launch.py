@@ -118,6 +118,6 @@ def generate_launch_description():
         pedestrian_detector_node,
         traffic_light_node,
         track_drive_node,
-        overtake_drive_node,
+        # overtake_drive_node,  # 카메라 추월 방식 전환으로 비활성화
         goal_sender_node,
     ])

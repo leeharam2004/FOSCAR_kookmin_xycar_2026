@@ -25,12 +25,13 @@ def generate_launch_description():
             name='track_drive_2',
             output='screen',
         ),
-        Node(
-            package='track_drive',
-            executable='overtake_drive',
-            name='overtake_drive',
-            output='screen',
-        ),
+        # 카메라 추월 방식 전환으로 비활성화
+        # Node(
+        #     package='track_drive',
+        #     executable='overtake_drive',
+        #     name='overtake_drive',
+        #     output='screen',
+        # ),
         Node(
             package='track_drive',
             executable='traffic_light',
