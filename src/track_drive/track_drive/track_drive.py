@@ -20,6 +20,7 @@ from xycar_msgs.msg import XycarMotor
 #   2 — 모든 창 표시
 # =============================================
 DEBUG_LEVEL         = 1
+WHITE_TUNING        = False   # True로 바꾸면 white HSV 트랙바 창 활성화
 YELLOW_TUNING       = False   # True로 바꾸면 yellow HSV 트랙바 창 활성화
 OVERTAKE_CAR_TUNING = False   # True로 바꾸면 overtake 차량 HSV 트랙바 + 마스크 창 활성화
 STANLEY_TUNING      = False   # True로 바꾸면 Stanley 파라미터 트랙바 창 활성화
@@ -76,8 +77,8 @@ KI  = 0.0   # 적분
 KSW = 1.0   # 차선 위치 오차 가중치
 KFF = 0.0   # 커브 feedforward 게인
 
-SPEED_MAX   = 21.0  # 직선 최대 속도
-SPEED_MIN   = 6.0  # 커브 최소 속도
+SPEED_MAX   = 19.5  # 직선 최대 속도
+SPEED_MIN   = 5.0  # 커브 최소 속도
 SPEED_KD    = 27.0  # 떨림 기반 감속 게인 (d_error 기준)
 
 # =============================================
@@ -90,7 +91,7 @@ LANE_REF_R       = int(ROI_W * 0.75) - 28               # 우측 차선 기준 x
 LANE_REF_L       = int(ROI_W * 0.25) + 28               # 좌측 차선 기준 x (188)
 
 # Stanley 파라미터 (튜닝 필요)
-STANLEY_HEADING_SCALE = 55.0   # slope → angle 단위 변환 게인
+STANLEY_HEADING_SCALE = 56.0   # slope → angle 단위 변환 게인
 STANLEY_K             = 1.7   # cross-track 게인
 STANLEY_V_MIN         = 1.0    # 속도 하한 (0 나눗셈 방지)
 
@@ -168,12 +169,13 @@ class HSVTuner:
 class Preprocessing:
 
     def __init__(self, src_points=SRC_POINTS, dst_points=DST_POINTS,
-                 warped_size=WARPED_SIZE, yellow_tuner=None):
+                 warped_size=WARPED_SIZE, white_tuner=None, yellow_tuner=None):
 
         self.M     = cv2.getPerspectiveTransform(src_points, dst_points)
         self.M_inv = cv2.getPerspectiveTransform(dst_points, src_points)
         self.warped_size  = warped_size
         self._src_points  = src_points
+        self.white_tuner  = white_tuner
         self.yellow_tuner = yellow_tuner
 
     # -----------------------------------------
@@ -206,8 +208,14 @@ class Preprocessing:
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        white_mask  = cv2.inRange(hsv, np.array([0,  0,  150]),
-                                       np.array([180, 80, 255]))
+        if self.white_tuner is not None:
+            lower_w, upper_w = self.white_tuner.get_range()
+        else:
+            lower_w = np.array([0,   0, 254])
+            upper_w = np.array([1, 1, 255])
+        white_mask = cv2.inRange(hsv, lower_w, upper_w)
+        if self.white_tuner is not None:
+            self.white_tuner.show_mask(white_mask)
 
         if self.yellow_tuner is not None:
             lower_y, upper_y = self.yellow_tuner.get_range()
@@ -935,7 +943,8 @@ OVERTAKE_CAR_MIN_PIXELS     = 200     # 노이즈 방지 최소 픽셀 수
 CAMERA_OVERTAKE_ENTER_FRAMES   = 5    # 노란 차 N프레임 연속 감지 → LANE2 (튜닝)
 CAMERA_OVERTAKE_LOSE_FRAMES    = 5   # 노란 차 M프레임 연속 미감지 → WAITING (튜닝)
 CAMERA_OVERTAKE_RETURN_FRAMES  = 1   # WAITING 후 LANE1 복귀 대기 프레임 (튜닝)
-CAMERA_OVERTAKE_LATERAL_OFFSET = 80  # Stanley 우측 offset px (LANE2, 튜닝)
+CAMERA_OVERTAKE_LATERAL_OFFSET = 150  # Stanley 우측 offset px (LANE2, 튜닝)
+CAMERA_OVERTAKE_LANE1_OFFSET   = -25 # Stanley 좌측 offset px (LANE1, 튜닝)
 
 # =============================================
 # LidarOvertakeDecision (구 OvertakeDecision)
@@ -1017,30 +1026,33 @@ class LidarOvertakeDecision:
 # overtake_drive 노드 없이 동작하며 LidarOvertakeDecision과 교환 가능.
 #
 # 상태:
-#   LANE1  : 중앙 주행  — lateral_offset = 0
-#   LANE2  : 우측 주행  — lateral_offset = CAMERA_OVERTAKE_LATERAL_OFFSET (양수)
-#   WAITING: 차 소실 후 대기 — lateral_offset 유지, 타임아웃 후 LANE1
+#   DISABLED: 초기/비활성 — lateral_offset = 0
+#   LANE2   : 우측 주행   — lateral_offset = +CAMERA_OVERTAKE_LATERAL_OFFSET
+#   WAITING : 차 소실 대기 — lateral_offset 유지
+#   LANE1   : 좌측 주행   — lateral_offset = CAMERA_OVERTAKE_LANE1_OFFSET (음수)
 #
 # 전환:
-#   LANE1  → LANE2   : 노란 차 ENTER_FRAMES 연속 감지
-#   LANE2  → WAITING : 노란 차 LOSE_FRAMES 연속 미감지
-#   WAITING→ LANE2   : 노란 차 재감지 (아직 앞에 있음)
-#   WAITING→ LANE1   : RETURN_FRAMES 경과 → offset=0
-#   any    → LANE1   : school_zone_active → offset=0 (중앙)
+#   DISABLED → LANE2   : 노란 차 ENTER_FRAMES 연속 감지
+#   LANE2    → WAITING : 노란 차 LOSE_FRAMES 연속 미감지
+#   WAITING  → LANE2   : 노란 차 재감지
+#   WAITING  → LANE1   : RETURN_FRAMES 경과
+#   LANE1    : 노란 차 감지 무시
+#   any      → DISABLED: school_zone_active → offset=0
 # =============================================
 class CameraOvertakeDecision:
 
-    _LANE1   = 'LANE1'
-    _LANE2   = 'LANE2'
-    _WAITING = 'WAITING'
+    _DISABLED = 'DISABLED'
+    _LANE1    = 'LANE1'
+    _LANE2    = 'LANE2'
+    _WAITING  = 'WAITING'
 
     def __init__(self, logger, tuner=None):
         self.logger          = logger
         self.tuner           = tuner
-        self._state          = self._LANE1
+        self._state          = self._DISABLED
         self._lateral_offset = 0.0
 
-        self._enter_streak = 0   # 연속 감지 프레임 (LANE1→LANE2)
+        self._enter_streak = 0   # 연속 감지 프레임 (DISABLED→LANE2)
         self._lose_streak  = 0   # 연속 미감지 프레임 (LANE2→WAITING)
         self._wait_frames  = 0   # WAITING 경과 프레임
 
@@ -1062,14 +1074,14 @@ class CameraOvertakeDecision:
 
     def update_gate(self, roi, school_zone_active):
         if school_zone_active:
-            self._enter(self._LANE1)
+            self._enter(self._DISABLED)
             self._lateral_offset = 0.0
             self._enter_streak = self._lose_streak = self._wait_frames = 0
             return
 
         car_visible = self._detect_yellow_car(roi)
 
-        if self._state == self._LANE1:
+        if self._state == self._DISABLED:
             self._enter_streak = self._enter_streak + 1 if car_visible else 0
             if self._enter_streak >= CAMERA_OVERTAKE_ENTER_FRAMES:
                 self._enter(self._LANE2)
@@ -1093,7 +1105,10 @@ class CameraOvertakeDecision:
                 self._wait_frames += 1
                 if self._wait_frames >= CAMERA_OVERTAKE_RETURN_FRAMES:
                     self._enter(self._LANE1)
-                    self._lateral_offset = 0.0
+                    self._lateral_offset = float(CAMERA_OVERTAKE_LANE1_OFFSET)
+
+        elif self._state == self._LANE1:
+            pass  # 노란 차 재감지 무시
 
     def get_lateral_offset(self):
         return self._lateral_offset
@@ -1117,6 +1132,10 @@ class MainLoop(Node):
         self.new_image     = False
         self.stop_line_result = None
         self.lane_image = None
+        white_tuner = HSVTuner(
+            'White Lane',
+            dict(H_min=0, H_max=180, S_min=0, S_max=80, V_min=150, V_max=255),
+        ) if WHITE_TUNING else None
         yellow_tuner = HSVTuner(
             'Yellow Lane',
             dict(H_min=10, H_max=40, S_min=242, S_max=255, V_min=80, V_max=255),
@@ -1126,7 +1145,7 @@ class MainLoop(Node):
             dict(H_min=13, H_max=54, S_min=128, S_max=193, V_min=128, V_max=255),
             min_pixels=OVERTAKE_CAR_MIN_PIXELS,
         ) if OVERTAKE_CAR_TUNING else None
-        self.preprocessing = Preprocessing(yellow_tuner=yellow_tuner)
+        self.preprocessing = Preprocessing(white_tuner=white_tuner, yellow_tuner=yellow_tuner)
         self.school_zone = SchoolZoneDetector()
         self.checkered_zone = CheckeredZoneDetector()
         self.slidewindow   = SlideWindow()
@@ -1285,6 +1304,8 @@ class MainLoop(Node):
 
             # LidarOvertakeDecision 사용 시 활성화 (각도/속도 직접 override)
             # angle, speed = self.overtake.apply(angle, speed)
+            if self.school_zone.school_zone_mode:
+                speed = min(speed, 15.0)
             self._last_speed = float(speed)
 
             msg = XycarMotor()
