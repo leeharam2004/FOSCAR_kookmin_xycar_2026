@@ -6,7 +6,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import FollowWaypoints
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from std_msgs.msg import Int64MultiArray
+from std_msgs.msg import Bool, Int64MultiArray
 
 
 # (x, y, ori_z, ori_w)
@@ -38,6 +38,7 @@ class GoalSenderNode(Node):
         super().__init__('goal_sender')
         self._initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, '/initialpose', 10)
+        self._nav2_bypass_pub = self.create_publisher(Bool, '/nav2_bypass', 10)
         self._client = ActionClient(self, FollowWaypoints, 'follow_waypoints')
         self._green_detected = False
         self.create_subscription(Int64MultiArray, '/traffic_light', self._traffic_light_callback, 10)
@@ -90,7 +91,13 @@ class GoalSenderNode(Node):
         goal_handle.get_result_async().add_done_callback(self._result_callback)
 
     def _result_callback(self, future):
-        self.get_logger().info('All waypoints completed — killing motor_translator')
+        self.get_logger().info('All waypoints completed — enabling lane driving')
+
+        bypass_msg = Bool()
+        bypass_msg.data = True
+        for _ in range(3):
+            self._nav2_bypass_pub.publish(bypass_msg)
+            time.sleep(0.05)
 
         # [현재: 방법 1] motor_translator 프로세스를 직접 종료 → count_publishers가 1로 떨어져 track_drive 활성화
         subprocess.Popen(['pkill', '-f', 'motor_translator'])

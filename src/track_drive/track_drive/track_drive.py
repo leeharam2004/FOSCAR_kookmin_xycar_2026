@@ -79,6 +79,7 @@ KFF = 0.0   # 커브 feedforward 게인
 SPEED_MAX   = 21.0  # 직선 최대 속도
 SPEED_MIN   = 6.0  # 커브 최소 속도
 SPEED_KD    = 27.0  # 떨림 기반 감속 게인 (d_error 기준)
+SCHOOL_ZONE_SPEED_LIMIT = 15.0  # XycarMotor.speed 기준 약 30km/h 제한
 
 # =============================================
 # 컨트롤러 선택 및 공용 파라미터
@@ -115,8 +116,8 @@ CHECKERED_EXIT_FRAMES       = 10
 # =============================================
 # 정지선 검출 파라미터 (BEV warped_white 기준)
 # =============================================
-STOP_LINE_Y_START        = 170
-STOP_LINE_Y_END          = 280
+STOP_LINE_Y_START        = 130
+STOP_LINE_Y_END          = 240
 STOP_LINE_X_MARGIN       = 70
 STOP_LINE_MIN_WIDTH      = 260
 STOP_LINE_MIN_HEIGHT     = 3
@@ -934,7 +935,8 @@ OVERTAKE_CAR_MIN_PIXELS     = 200     # 노이즈 방지 최소 픽셀 수
 # =============================================
 CAMERA_OVERTAKE_ENTER_FRAMES   = 5    # 노란 차 N프레임 연속 감지 → LANE2 (튜닝)
 CAMERA_OVERTAKE_LOSE_FRAMES    = 5   # 노란 차 M프레임 연속 미감지 → WAITING (튜닝)
-CAMERA_OVERTAKE_RETURN_FRAMES  = 1   # WAITING 후 LANE1 복귀 대기 프레임 (튜닝)
+CAMERA_OVERTAKE_PASS_HOLD_FRAMES = 8  # 노란 차 소실 후 우측 주행 유지 프레임 (튜닝)
+CAMERA_OVERTAKE_RETURN_FRAMES  = 25  # 원래 차선 목표점으로 복귀 유지 프레임 (튜닝)
 CAMERA_OVERTAKE_LATERAL_OFFSET = 80  # Stanley 우측 offset px (LANE2, 튜닝)
 
 # =============================================
@@ -1019,13 +1021,15 @@ class LidarOvertakeDecision:
 # 상태:
 #   LANE1  : 중앙 주행  — lateral_offset = 0
 #   LANE2  : 우측 주행  — lateral_offset = CAMERA_OVERTAKE_LATERAL_OFFSET (양수)
-#   WAITING: 차 소실 후 대기 — lateral_offset 유지, 타임아웃 후 LANE1
+#   WAITING: 차 소실 후 대기 — lateral_offset 유지, 타임아웃 후 RETURNING
+#   RETURNING: 추월 완료 후 원래 차선 목표점으로 복귀 — lateral_offset = 0
 #
 # 전환:
 #   LANE1  → LANE2   : 노란 차 ENTER_FRAMES 연속 감지
 #   LANE2  → WAITING : 노란 차 LOSE_FRAMES 연속 미감지
 #   WAITING→ LANE2   : 노란 차 재감지 (아직 앞에 있음)
-#   WAITING→ LANE1   : RETURN_FRAMES 경과 → offset=0
+#   WAITING→ RETURNING: PASS_HOLD_FRAMES 경과 → offset=0
+#   RETURNING→ LANE1 : RETURN_FRAMES 경과
 #   any    → LANE1   : school_zone_active → offset=0 (중앙)
 # =============================================
 class CameraOvertakeDecision:
@@ -1033,6 +1037,7 @@ class CameraOvertakeDecision:
     _LANE1   = 'LANE1'
     _LANE2   = 'LANE2'
     _WAITING = 'WAITING'
+    _RETURNING = 'RETURNING'
 
     def __init__(self, logger, tuner=None):
         self.logger          = logger
@@ -1043,6 +1048,7 @@ class CameraOvertakeDecision:
         self._enter_streak = 0   # 연속 감지 프레임 (LANE1→LANE2)
         self._lose_streak  = 0   # 연속 미감지 프레임 (LANE2→WAITING)
         self._wait_frames  = 0   # WAITING 경과 프레임
+        self._return_frames = 0  # RETURNING 경과 프레임
 
     def _detect_yellow_car(self, roi):
         if self.tuner is not None:
@@ -1064,7 +1070,8 @@ class CameraOvertakeDecision:
         if school_zone_active:
             self._enter(self._LANE1)
             self._lateral_offset = 0.0
-            self._enter_streak = self._lose_streak = self._wait_frames = 0
+            self._enter_streak = self._lose_streak = 0
+            self._wait_frames = self._return_frames = 0
             return
 
         car_visible = self._detect_yellow_car(roi)
@@ -1075,6 +1082,8 @@ class CameraOvertakeDecision:
                 self._enter(self._LANE2)
                 self._lateral_offset = float(CAMERA_OVERTAKE_LATERAL_OFFSET)
                 self._lose_streak = 0
+                self._wait_frames = 0
+                self._return_frames = 0
 
         elif self._state == self._LANE2:
             if car_visible:
@@ -1089,11 +1098,25 @@ class CameraOvertakeDecision:
             if car_visible:
                 self._enter(self._LANE2)
                 self._lose_streak = 0
+                self._wait_frames = 0
             else:
                 self._wait_frames += 1
-                if self._wait_frames >= CAMERA_OVERTAKE_RETURN_FRAMES:
-                    self._enter(self._LANE1)
+                if self._wait_frames >= CAMERA_OVERTAKE_PASS_HOLD_FRAMES:
+                    self._enter(self._RETURNING)
                     self._lateral_offset = 0.0
+                    self._return_frames = 0
+
+        elif self._state == self._RETURNING:
+            if car_visible:
+                self._enter(self._LANE2)
+                self._lateral_offset = float(CAMERA_OVERTAKE_LATERAL_OFFSET)
+                self._lose_streak = 0
+                self._wait_frames = 0
+            else:
+                self._return_frames += 1
+                if self._return_frames >= CAMERA_OVERTAKE_RETURN_FRAMES:
+                    self._enter(self._LANE1)
+                    self._enter_streak = 0
 
     def get_lateral_offset(self):
         return self._lateral_offset
@@ -1282,6 +1305,8 @@ class MainLoop(Node):
             angle, speed = ctrl.compute(sw, self._last_speed,
                                         lateral_offset=lateral_offset,
                                         single_lane_ok=single_lane_ok)
+            if self.school_zone.school_zone_mode:
+                speed = min(float(speed), SCHOOL_ZONE_SPEED_LIMIT)
 
             # LidarOvertakeDecision 사용 시 활성화 (각도/속도 직접 override)
             # angle, speed = self.overtake.apply(angle, speed)
