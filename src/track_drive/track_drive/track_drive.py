@@ -116,8 +116,8 @@ CHECKERED_EXIT_FRAMES       = 10
 # =============================================
 # 정지선 검출 파라미터 (BEV warped_white 기준)
 # =============================================
-STOP_LINE_Y_START        = 170
-STOP_LINE_Y_END          = 280
+STOP_LINE_Y_START        = 120
+STOP_LINE_Y_END          = 240
 STOP_LINE_X_MARGIN       = 70
 STOP_LINE_MIN_WIDTH      = 260
 STOP_LINE_MIN_HEIGHT     = 3
