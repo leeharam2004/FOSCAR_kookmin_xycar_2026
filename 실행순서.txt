@@ -26,8 +26,7 @@
 
 워크스페이스 루트 디렉터리(/home/user/xycar_ws)에서 아래 명령어를 실행합니다.
 
-    colcon build --symlink-install
-    source install/setup.bash
+    colcon build --symlink-install && source install/setup.bash
 
 ※ 빌드 후에는 반드시 source 명령어를 실행하여 환경 변수를 갱신하여야 합니다.
 
